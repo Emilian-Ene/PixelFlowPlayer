@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/root_layout"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/black"
+    tools:context=".player.MainActivity">
+
+    <!-- Group for Pairing & Paired States -->
+    <LinearLayout
+        android:id="@+id/pairing_view"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:gravity="center"
+        android:orientation="vertical">
+        <TextView
+            android:id="@+id/main_status_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:fontFamily="sans-serif-thin"
+            android:textColor="@color/teal_text"
+            android:textSize="80sp"
+            android:textStyle="bold"
+            tools:text="L2DU9R" />
+        <TextView
+            android:id="@+id/url_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="120dp"
+            android:text="@string/pairing_url"
+            android:textColor="@android:color/white"
+            android:textSize="22sp" />
+        <TextView
+            android:id="@+id/instructions_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/pairing_instructions_unpaired"
+            android:textColor="@android:color/darker_gray"
+            android:textSize="16sp" />
+    </LinearLayout>
+
+    <!-- Loading Bar -->
+    <ProgressBar
+        android:id="@+id/loading_bar"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:indeterminateTint="@color/teal_text"
+        android:visibility="gone"
+        tools:visibility="visible" />
+
+    <!-- Exit Button -->
+    <ImageView
+        android:id="@+id/exit_button"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_gravity="top|end"
+        android:layout_marginTop="16dp"
+        android:layout_marginEnd="16dp"
+        android:background="?attr/selectableItemBackgroundBorderless"
+        android:contentDescription="@string/exit_button_description"
+        android:padding="8dp"
+        android:src="@drawable/ic_close"
+        app:tint="@android:color/white"
+        android:visibility="gone" />
+
+    <!-- Player Container -->
+    <FrameLayout
+        android:id="@+id/player_container"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone">
+        <androidx.media3.ui.PlayerView
+            android:id="@+id/video_player_view"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            app:use_controller="false"
+            app:resize_mode="zoom"/>
+        <ImageView
+            android:id="@+id/image_player_view"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:scaleType="centerCrop" />
+    </FrameLayout>
+
+</FrameLayout>

@@ -1,0 +1,11 @@
+<resources>
+    <string name="app_name">PixelFlowPlayer</string>
+    <string name="pairing_url">app.flowpixel.com</string>
+    <string name="pairing_instructions_unpaired">to pair the device and start using it</string>
+    <string name="paired_title">Paired</string>
+    <string name="pairing_instructions_paired">to assign content</string>
+    <string name="exit_dialog_title">Do you want to exit PixelFlowPlayer?</string>
+    <string name="exit_dialog_exit_button">EXIT</string>
+    <string name="exit_dialog_cancel_button">CANCEL</string>
+    <string name="exit_button_description">Exit Application</string>
+</resources>
