@@ -1,6 +1,6 @@
 package com.example.pixelflowplayer.player
 
-import android.content.Context
+import android.annotation.SuppressLint
 import android.content.SharedPreferences
 import android.net.ConnectivityManager
 import android.net.Network
@@ -74,7 +74,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-        sharedPreferences = getSharedPreferences("PixelFlowPlayerPrefs", Context.MODE_PRIVATE)
+        sharedPreferences = getSharedPreferences("PixelFlowPlayerPrefs", MODE_PRIVATE)
         findViews()
         setupFullscreen()
         setupInteractions()
@@ -97,7 +97,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupNetworkMonitoring() {
-        connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        connectivityManager = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 super.onAvailable(network)
@@ -246,7 +246,7 @@ class MainActivity : AppCompatActivity() {
         val jsonString = sharedPreferences.getString("localPlaylist", null) ?: return null
         return try {
             gson.fromJson(jsonString, Playlist::class.java)
-        } catch (e: Exception) { null }
+        } catch (_: Exception) { null }
     }
 
     private fun stopHeartbeat() {
@@ -359,10 +359,12 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    @SuppressLint("ClickableViewAccessibility")
     private fun setupInteractions() {
         exitButton.setOnClickListener { showExitConfirmationDialog() }
-        rootLayout.setOnTouchListener { _, _ ->
+        rootLayout.setOnTouchListener { view, _ ->
             showExitButtonTemporarily()
+            view.performClick()
             false
         }
         rootLayout.setOnHoverListener { _, motionEvent ->
