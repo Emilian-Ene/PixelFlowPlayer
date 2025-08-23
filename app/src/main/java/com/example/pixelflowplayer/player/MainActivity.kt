@@ -42,7 +42,7 @@ import java.util.*
 
 class MainActivity : AppCompatActivity() {
 
-    // --- Views (offlineIndicator REMOVED) ---
+    // --- Views ---
     private lateinit var rootLayout: FrameLayout
     private lateinit var pairingView: View
     private lateinit var loadingBar: ProgressBar
@@ -54,6 +54,7 @@ class MainActivity : AppCompatActivity() {
     private var exoPlayer: ExoPlayer? = null
     private lateinit var videoPlayerView: PlayerView
     private lateinit var imagePlayerView: ImageView
+    private lateinit var offlineIndicator: ImageView
 
     // --- Logic ---
     private lateinit var sharedPreferences: SharedPreferences
@@ -90,6 +91,7 @@ class MainActivity : AppCompatActivity() {
         instructionsText = findViewById(R.id.instructions_text)
         exitButton = findViewById(R.id.exit_button)
         playerContainer = findViewById(R.id.player_container)
+        offlineIndicator = findViewById(R.id.offline_indicator)
         videoPlayerView = findViewById(R.id.video_player_view)
         imagePlayerView = findViewById(R.id.image_player_view)
     }
@@ -110,10 +112,10 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread { updateUI() }
             }
         }
-
-
+        val networkRequest = NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build()
+        connectivityManager.registerNetworkCallback(networkRequest, networkCallback)
         isNetworkCurrentlyConnected = isInitialNetworkConnected()
-        updateUI()
+        startSplashScreenFlow()
     }
 
     private fun updateUI() {
@@ -125,10 +127,18 @@ class MainActivity : AppCompatActivity() {
             } else {
                 showPairedScreen()
             }
-            startHeartbeat()
+
+            if (isNetworkCurrentlyConnected) {
+                offlineIndicator.visibility = View.GONE
+                startHeartbeat()
+            } else {
+                // If paired and offline, show the indicator.
+                offlineIndicator.visibility = View.VISIBLE
+                stopHeartbeat() // Stop trying to connect to save resources
+            }
         } else {
             // New Device Flow
-            startSplashScreenFlow()
+            startHeartbeat()
         }
     }
 
@@ -136,7 +146,7 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch {
             showLoadingScreen()
             delay(10000)
-            startHeartbeat()
+            updateUI()
         }
     }
 
