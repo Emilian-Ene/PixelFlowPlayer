@@ -292,6 +292,9 @@ class MainActivity : AppCompatActivity() {
             prepare()
             play()
         }
+        if (item.duration > 0) {
+            playerHandler.postDelayed({ playNextItem() }, item.duration * 1000L)
+        }
     }
 
     private fun showImage(item: PlaylistItem) {
@@ -307,6 +310,8 @@ class MainActivity : AppCompatActivity() {
         exoPlayer?.release()
         exoPlayer = null
     }
+
+
 
     override fun onDestroy() {
         super.onDestroy()
