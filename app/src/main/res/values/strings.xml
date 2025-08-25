@@ -8,4 +8,6 @@
     <string name="exit_dialog_exit_button">EXIT</string>
     <string name="exit_dialog_cancel_button">CANCEL</string>
     <string name="exit_button_description">Exit Application</string>
+    <string name="image_player_description">Displayed image content</string>
+    <string name="offline_indicator_description">Offline indicator icon</string>
 </resources>

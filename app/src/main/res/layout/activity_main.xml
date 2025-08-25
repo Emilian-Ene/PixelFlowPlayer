@@ -84,16 +84,18 @@
             android:id="@+id/image_player_view"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:scaleType="centerCrop" />
+            android:scaleType="centerCrop"
+            android:contentDescription="@string/image_player_description" />
     </FrameLayout>
 
     <!-- Offline Indicator (IT IS NOW PRESENT) -->
     <ImageView
         android:id="@+id/offline_indicator"
-        android:layout_width="48dp"
-        android:layout_height="48dp"
+        android:layout_width="32dp"
+        android:layout_height="32dp"
         android:layout_gravity="bottom|start"
         android:layout_margin="16dp"
         android:src="@drawable/ic_offline_indicator"
-        android:visibility="gone" />
+        android:visibility="gone"
+        android:contentDescription="@string/offline_indicator_description" />
 </FrameLayout>
