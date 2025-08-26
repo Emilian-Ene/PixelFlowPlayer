@@ -3,9 +3,7 @@ package com.example.pixelflowplayer.player
 import android.annotation.SuppressLint
 import android.content.SharedPreferences
 import android.net.ConnectivityManager
-import android.net.Network
 import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -33,6 +31,7 @@ import com.google.gson.Gson
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -65,13 +64,13 @@ class MainActivity : AppCompatActivity() {
     private var heartbeatJob: Job? = null
     private val gson = Gson()
     private lateinit var connectivityManager: ConnectivityManager
-    private lateinit var networkCallback: ConnectivityManager.NetworkCallback
     private var isNetworkCurrentlyConnected = false
     private val hideExitButtonHandler = Handler(Looper.getMainLooper())
     private val hideExitButtonRunnable = Runnable { exitButton.visibility = View.GONE }
 
     companion object {
         private const val KEY_PENDING_PAIRING_CODE = "pendingPairingCode"
+        private const val TAG = "PixelFlowPlayer"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -82,7 +81,13 @@ class MainActivity : AppCompatActivity() {
         setupFullscreen()
         setupInteractions()
         deviceId = getOrCreateDeviceId()
+
+        // --- Network Monitoring Setup ---
         setupNetworkMonitoring()
+        isNetworkCurrentlyConnected = isInitialNetworkConnected()
+        Log.d(TAG, "onCreate: Initial network state: $isNetworkCurrentlyConnected")
+        startSplashScreenFlow()
+        startPeriodicNetworkCheck()
     }
 
     private fun findViews() {
@@ -101,81 +106,63 @@ class MainActivity : AppCompatActivity() {
 
     private fun setupNetworkMonitoring() {
         connectivityManager = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
-        networkCallback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                super.onAvailable(network)
-                val caps = connectivityManager.getNetworkCapabilities(network)
-                val hasValidatedInternet = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
-                if (hasValidatedInternet && !isNetworkCurrentlyConnected) {
-                    isNetworkCurrentlyConnected = true
-                    runOnUiThread { updateUI() }
-                } else if (!hasValidatedInternet && isNetworkCurrentlyConnected) {
-                    // Became available but not validated, treat as disconnected if previously thought connected
-                    isNetworkCurrentlyConnected = false
-                    runOnUiThread { updateUI() }
-                } else if (hasValidatedInternet && isNetworkCurrentlyConnected) {
-                    // Still connected and validated, no need to update UI unless state changes
-                } else {
-                     // Not validated and wasn't connected, ensure UI reflects this
-                    isNetworkCurrentlyConnected = false
-                    runOnUiThread { updateUI() }
+    }
+
+    private fun startPeriodicNetworkCheck() {
+        lifecycleScope.launch {
+            while (isActive) {
+                val currentNetworkStatus = isInitialNetworkConnected()
+                if (currentNetworkStatus != isNetworkCurrentlyConnected) {
+                    isNetworkCurrentlyConnected = currentNetworkStatus
+                    withContext(Dispatchers.Main) {
+                        Log.d(TAG, "Periodic network check: Status changed to $isNetworkCurrentlyConnected. Updating UI.")
+                        updateUI()
+                    }
                 }
-            }
-            override fun onLost(network: Network) {
-                super.onLost(network)
-                if (isNetworkCurrentlyConnected) {
-                    isNetworkCurrentlyConnected = false
-                    runOnUiThread { updateUI() }
-                }
+                delay(15000) // Check every 15 seconds
             }
         }
-        val networkRequest = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-            .build()
-        connectivityManager.registerNetworkCallback(networkRequest, networkCallback)
-        isNetworkCurrentlyConnected = isInitialNetworkConnected()
-        startSplashScreenFlow()
     }
 
     private fun updateUI() {
-        // 1. Set the offline indicator based on the most current network status
+        val currentlyPaired = sharedPreferences.getBoolean("isPaired", false)
+        Log.d(TAG, "updateUI() called. isNetworkCurrentlyConnected: $isNetworkCurrentlyConnected. isPaired from SharedPreferences: $currentlyPaired")
+
         if (isNetworkCurrentlyConnected) {
             offlineIndicator.visibility = View.GONE
         } else {
             offlineIndicator.visibility = View.VISIBLE
         }
 
-        // 2. Proceed with device state logic (paired/unpaired)
-        if (sharedPreferences.getBoolean("isPaired", false)) {
-            // Paired Device Flow
+        if (currentlyPaired) {
+            Log.d(TAG, "updateUI: Device state is PAIRED.")
             val localPlaylist = getLocalPlaylist()
             if (localPlaylist != null && localPlaylist.items.isNotEmpty()) {
-                startPlayback(localPlaylist) // This shows player screen
+                startPlayback(localPlaylist)
             } else {
-                showPairedScreen() // Shows "Paired, waiting for content"
+                showPairedScreen()
             }
 
             if (isNetworkCurrentlyConnected) {
-                startHeartbeat() // Try to sync with server
+                startHeartbeat()
             } else {
-                stopHeartbeat() // Don't try if offline
+                stopHeartbeat()
             }
         } else {
-            // Unpaired Device Flow
-            // The pairing screen and heartbeat attempt for unpaired devices are handled within startHeartbeat()
-            // If offline, the indicator is already visible.
-            // If online, the indicator is hidden.
-            startHeartbeat() // This will call getOrCreatePendingPairingCode and showPairingScreen()
+            Log.d(TAG, "updateUI: Device state is UNPAIRED.")
+            // Heartbeat must run to get pairing status, even if offline initially, to show the pairing code.
+            startHeartbeat()
         }
     }
-
 
     private fun startSplashScreenFlow() {
         lifecycleScope.launch {
             showLoadingScreen()
-            delay(10000) // Keep splash for a bit to allow network to settle
-            isNetworkCurrentlyConnected = isInitialNetworkConnected() // Re-check network before first proper UI update
-            updateUI()
+            delay(5000) // Shorter delay, network check is now periodic
+            isNetworkCurrentlyConnected = isInitialNetworkConnected()
+            withContext(Dispatchers.Main) {
+                updateUI()
+            }
         }
     }
 
@@ -184,86 +171,145 @@ class MainActivity : AppCompatActivity() {
         if (code == null) {
             code = generatePairingCode()
             sharedPreferences.edit { putString(KEY_PENDING_PAIRING_CODE, code) }
+            Log.d(TAG, "getOrCreatePendingPairingCode: Generated new code: $code")
         }
         return code
     }
 
     private fun startHeartbeat() {
-        if (heartbeatJob?.isActive == true) return
+        if (heartbeatJob?.isActive == true) {
+            Log.d(TAG, "startHeartbeat: Heartbeat job is already active. Skipping.")
+            return
+        }
+        Log.d(TAG, "startHeartbeat: Starting new heartbeat job.")
         heartbeatJob = lifecycleScope.launch {
-            var pairingCode = ""
-            if (!sharedPreferences.getBoolean("isPaired", false)) {
-                pairingCode = getOrCreatePendingPairingCode()
-                // Ensure pairing screen is shown immediately if unpaired,
-                // even if offline, the pairing code needs to be visible.
-                showPairingScreen(pairingCode, getString(R.string.pairing_instructions_unpaired))
+            var pairingCodeForHeartbeat: String
+
+            val isDeviceCurrentlyPaired = sharedPreferences.getBoolean("isPaired", false)
+            Log.d(TAG, "startHeartbeat (coroutine): Checking pairing status. isPaired: $isDeviceCurrentlyPaired")
+
+            if (!isDeviceCurrentlyPaired) {
+                Log.d(TAG, "startHeartbeat (coroutine): Device is NOT PAIRED. Will get/create code and show pairing screen.")
+                pairingCodeForHeartbeat = getOrCreatePendingPairingCode()
+                Log.d(TAG, "startHeartbeat (coroutine): Using pending pairing code: $pairingCodeForHeartbeat")
+                withContext(Dispatchers.Main) {
+                    Log.d(TAG, "startHeartbeat (coroutine): Now calling showPairingScreen with code: $pairingCodeForHeartbeat")
+                    showPairingScreen(pairingCodeForHeartbeat, getString(R.string.pairing_instructions_unpaired))
+                }
+            } else {
+                Log.d(TAG, "startHeartbeat (coroutine): Device is PAIRED. Proceeding with paired heartbeat.")
+                pairingCodeForHeartbeat = "" // Must be empty for paired heartbeats
             }
-            while (true) {
-                if (!isNetworkCurrentlyConnected) { // Check before API call
-                    delay(15000) // Wait and retry if network is down
+
+            while (isActive) {
+                if (!isNetworkCurrentlyConnected) {
+                    delay(15000)
                     continue
                 }
                 try {
-                    val request = HeartbeatRequest(deviceId, pairingCode)
+                    val request = HeartbeatRequest(deviceId, pairingCodeForHeartbeat)
                     val response = ApiClient.apiService.deviceHeartbeat(request)
                     if (response.isSuccessful) {
                         val heartbeatResponse = response.body()
                         val wasPaired = sharedPreferences.getBoolean("isPaired", false)
+                        Log.d(TAG, "Heartbeat: Success. Response: ${heartbeatResponse?.status}. Current paired state: $wasPaired")
+
                         if (wasPaired && heartbeatResponse?.status == "unpaired") {
                             handleUnpairingAndReset()
-                            return@launch
-                        } else {
-                            when (heartbeatResponse?.status) {
-                                "paired_waiting" -> {
+                            return@launch // Stop this coroutine, handleUnpairing will trigger a new UI flow
+                        }
+
+                        when (heartbeatResponse?.status) {
+                            "paired_waiting" -> {
+                                if (!wasPaired) {
                                     sharedPreferences.edit {
                                         putBoolean("isPaired", true)
                                         remove(KEY_PENDING_PAIRING_CODE)
                                     }
-                                    showPairedScreen()
+                                    pairingCodeForHeartbeat = "" // Stop sending the code
+                                    withContext(Dispatchers.Main) { showPairedScreen() }
                                 }
-                                "playing" -> {
-                                    val newPlaylist = heartbeatResponse.playlist
-                                    if (newPlaylist != null && newPlaylist != getLocalPlaylist()) {
-                                        sharedPreferences.edit {
-                                            putBoolean("isPaired", true)
-                                            remove(KEY_PENDING_PAIRING_CODE)
-                                        }
-                                        showPairedScreen() // Show paired screen briefly during download
-                                        delay(2000)
-                                        val downloadedPlaylist = downloadContentAndCreateLocalPlaylist(newPlaylist)
-                                        saveLocalPlaylist(downloadedPlaylist)
-                                        startPlayback(downloadedPlaylist)
-                                    } else if (newPlaylist != null && newPlaylist == getLocalPlaylist() && playerContainer.visibility != View.VISIBLE) {
-                                        // If same playlist and player not visible, start playback
-                                        startPlayback(newPlaylist)
+                            }
+                            "playing" -> {
+                                if (!wasPaired) {
+                                    sharedPreferences.edit {
+                                        putBoolean("isPaired", true)
+                                        remove(KEY_PENDING_PAIRING_CODE)
                                     }
+                                    pairingCodeForHeartbeat = "" // Stop sending the code
+                                }
+                                val newPlaylist = heartbeatResponse.playlist
+                                if (newPlaylist != null && newPlaylist != getLocalPlaylist()) {
+                                    withContext(Dispatchers.Main) { showPairedScreen() }
+                                    delay(2000)
+                                    val downloadedPlaylist = downloadContentAndCreateLocalPlaylist(newPlaylist)
+                                    saveLocalPlaylist(downloadedPlaylist)
+                                    startPlayback(downloadedPlaylist)
+                                } else if (newPlaylist != null && playerContainer.visibility != View.VISIBLE) {
+                                    startPlayback(newPlaylist)
                                 }
                             }
                         }
                     } else {
-                         Log.d("Heartbeat", "Server responded with error: ${response.code()}. Retrying in 15s...")
+                         Log.w("Heartbeat", "Server responded with error: ${response.code()}. Retrying in 15s...")
                     }
                 } catch (e: Exception) {
-                    Log.d("Heartbeat", "Server connection failed: ${e.message}. Silently retrying in 15s...")
+                    if (isActive) {
+                        Log.e("Heartbeat", "Server connection failed: ${e.message}. Silently retrying in 15s...")
+                    }
                 }
                 delay(15000)
             }
         }
     }
 
+    // In MainActivity.kt
+
     private fun handleUnpairingAndReset() {
-        stopHeartbeat()
+        Log.d(TAG, "handleUnpairingAndReset: Device is being unpaired and reset.")
+        stopHeartbeat() // Stop the old loop
         releasePlayer()
         currentPlaylist = emptyList()
-        sharedPreferences.edit {
-            remove("isPaired")
-            remove("localPlaylist")
-            remove(KEY_PENDING_PAIRING_CODE) // Also clear pending code on unpair
+
+        // Launch a coroutine to handle async tasks (file cleanup and network call)
+        lifecycleScope.launch {
+            // Perform file cleanup in the background
+            withContext(Dispatchers.IO) {
+                cleanupOldFiles(emptySet())
+            }
+
+            // --- THE CORE FIX: GENERATE AND REPORT THE NEW CODE IMMEDIATELY ---
+
+            // 1. Generate a brand new pairing code.
+            val newPairingCode = generatePairingCode()
+            Log.d(TAG, "handleUnpairingAndReset: Generated new pairing code: $newPairingCode")
+
+            // 2. Synchronously update SharedPreferences with the new state.
+            //    This ensures the new code is saved before any other process can run.
+            sharedPreferences.edit(commit = true) {
+                putBoolean("isPaired", false)
+                remove("localPlaylist")
+                putString(KEY_PENDING_PAIRING_CODE, newPairingCode)
+            }
+            Log.d(TAG, "handleUnpairingAndReset: SharedPreferences updated. isPaired=false, new pending code saved.")
+
+            // 3. Immediately send a single, one-shot heartbeat to update the server.
+            //    This synchronizes the server's database with the code now on screen.
+            try {
+                val request = HeartbeatRequest(deviceId, newPairingCode)
+                ApiClient.apiService.deviceHeartbeat(request)
+                Log.d(TAG, "handleUnpairingAndReset: Successfully sent immediate heartbeat with new code to server.")
+            } catch (e: Exception) {
+                Log.e(TAG, "handleUnpairingAndReset: Failed to send immediate heartbeat. Server will sync on next cycle.", e)
+            }
+            // --- END FIX ---
+
+            // 4. Finally, update the UI on the main thread.
+            withContext(Dispatchers.Main) {
+                Log.d(TAG, "handleUnpairingAndReset: Calling updateUI to refresh state to UNPAIRED.")
+                updateUI() // This will now start the normal heartbeat loop, which will see the new code.
+            }
         }
-        lifecycleScope.launch(Dispatchers.IO) { cleanupOldFiles(emptySet()) }
-        // After unpairing, immediately attempt to get a new pairing code and show it.
-        isNetworkCurrentlyConnected = isInitialNetworkConnected() // Re-check network
-        updateUI() // This will trigger startHeartbeat which shows pairing screen
     }
 
     private suspend fun downloadContentAndCreateLocalPlaylist(remotePlaylist: Playlist): Playlist {
@@ -276,6 +322,7 @@ class MainActivity : AppCompatActivity() {
                 val localFile = File(filesDir, fileName)
                 if (!localFile.exists()) {
                     try {
+                        Log.d("Download", "Downloading ${item.url} to ${localFile.path}")
                         URL(item.url).openStream().use { input ->
                             FileOutputStream(localFile).use { output -> input.copyTo(output) }
                         }
@@ -290,8 +337,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun cleanupOldFiles(currentFileNames: Set<String>) {
+        Log.d(TAG, "Cleanup: Cleaning old files. Keeping: [${currentFileNames.joinToString()}]")
         filesDir.listFiles()?.forEach { file ->
-            if (!currentFileNames.contains(file.name)) { file.delete() }
+            if (!currentFileNames.contains(file.name)) {
+                Log.d(TAG, "Cleanup: Deleting old file ${file.name}")
+                file.delete()
+            }
         }
     }
 
@@ -304,11 +355,17 @@ class MainActivity : AppCompatActivity() {
         val jsonString = sharedPreferences.getString("localPlaylist", null) ?: return null
         return try {
             gson.fromJson(jsonString, Playlist::class.java)
-        } catch (_: Exception) { null }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to parse local playlist JSON", e)
+            null
+        }
     }
 
     private fun stopHeartbeat() {
-        heartbeatJob?.cancel()
+        if (heartbeatJob?.isActive == true) {
+            Log.d(TAG, "stopHeartbeat: Cancelling active heartbeat job.")
+            heartbeatJob?.cancel()
+        }
         heartbeatJob = null
     }
 
@@ -318,15 +375,21 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startPlayback(playlist: Playlist) {
-        showPlayerScreen()
-        currentPlaylist = playlist.items
-        currentItemIndex = 0
-        if (currentPlaylist.isNotEmpty()) { playNextItem() }
+        runOnUiThread {
+            showPlayerScreen()
+            currentPlaylist = playlist.items
+            currentItemIndex = 0
+            if (currentPlaylist.isNotEmpty()) {
+                playNextItem()
+            }
+        }
     }
 
     private fun playNextItem() {
         if (currentPlaylist.isEmpty()) return
-        if (currentItemIndex >= currentPlaylist.size) { currentItemIndex = 0 }
+        if (currentItemIndex >= currentPlaylist.size) {
+            currentItemIndex = 0
+        }
         val item = currentPlaylist[currentItemIndex]
         currentItemIndex++
         when (item.type.lowercase()) {
@@ -340,11 +403,13 @@ class MainActivity : AppCompatActivity() {
         videoPlayerView.visibility = View.VISIBLE
         imagePlayerView.visibility = View.GONE
         exoPlayer = ExoPlayer.Builder(this).build().apply {
-            setMediaItem(MediaItem.fromUri(item.url))
             videoPlayerView.player = this
+            setMediaItem(MediaItem.fromUri(item.url))
             addListener(object : Player.Listener {
                 override fun onPlaybackStateChanged(playbackState: Int) {
-                    if (playbackState == Player.STATE_ENDED) { playNextItem() }
+                    if (playbackState == Player.STATE_ENDED) {
+                        playNextItem()
+                    }
                 }
             })
             prepare()
@@ -369,11 +434,8 @@ class MainActivity : AppCompatActivity() {
         exoPlayer = null
     }
 
-
-
     override fun onDestroy() {
         super.onDestroy()
-        connectivityManager.unregisterNetworkCallback(networkCallback)
         stopHeartbeat()
         releasePlayer()
     }

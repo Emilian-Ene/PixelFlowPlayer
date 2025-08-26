@@ -20,14 +20,15 @@ data class HeartbeatResponse(
 
 // The interface defining our API endpoint
 interface ApiService {
-    @POST("api/devices/heartbeat")
+    @POST("devices/heartbeat") // Relative path to the base URL
     suspend fun deviceHeartbeat(@Body request: HeartbeatRequest): Response<HeartbeatResponse>
 }
 
 // A separate object to create and provide the ApiService instance
 object ApiClient {
     // IMPORTANT: Make sure this is your correct backend address and port
-    private const val BASE_URL = "http://10.0.2.2:5000/"
+    // Base URL now ends with a slash, and the specific endpoint path is in the @POST annotation
+    private const val BASE_URL = "http://10.0.2.2:3000/api/"
 
     private val retrofit = Retrofit.Builder()
         .baseUrl(BASE_URL)
