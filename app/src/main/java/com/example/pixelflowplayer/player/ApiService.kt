@@ -28,7 +28,7 @@ interface ApiService {
 object ApiClient {
     // IMPORTANT: Make sure this is your correct backend address and port
     // Base URL now ends with a slash, and the specific endpoint path is in the @POST annotation
-    private const val BASE_URL = "http://10.0.2.2:3000/api/"
+    private const val BASE_URL = "http://192.168.1.151:3000/api/"
 
     private val retrofit = Retrofit.Builder()
         .baseUrl(BASE_URL)

@@ -1,17 +1,31 @@
 package com.example.pixelflowplayer.player
 
-/**
- * Represents a full playlist, which is just a list of media items.
- * This structure must match the 'playlist' object in the JSON from your server.
- */
 data class Playlist(
     val items: List<PlaylistItem>
-)
+) {
+    // --- THIS IS THE NEW FUNCTION ---
+    /**
+     * Compares this playlist to another, checking only the essential content.
+     * It ignores differences in local vs. remote URLs.
+     */
+    fun isContentEqualTo(other: Playlist?): Boolean {
+        if (other == null) return false
+        if (this.items.size != other.items.size) return false
 
-/**
- * Represents a single item (an image or a video) within a playlist.
- * This structure must match the objects inside the 'items' array in the JSON.
- */
+        // Compare each item by its server URL and duration
+        for (i in this.items.indices) {
+            val thisItemServerUrl = this.items[i].url.substringAfterLast('/')
+            val otherItemServerUrl = other.items[i].url.substringAfterLast('/')
+
+            if (thisItemServerUrl != otherItemServerUrl || this.items[i].duration != other.items[i].duration) {
+                return false // Found a difference
+            }
+        }
+
+        return true // All items are identical
+    }
+}
+
 data class PlaylistItem(
     val type: String,
     val url: String,
