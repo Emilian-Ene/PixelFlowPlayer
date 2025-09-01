@@ -55,4 +55,9 @@
 
     </application>
 
+    <!-- The attribution tag is correctly placed here -->
+    <attribution
+        android:tag="mediaPlayback"
+        android:label="@string/media_playback_attribution_label" />
+
 </manifest>

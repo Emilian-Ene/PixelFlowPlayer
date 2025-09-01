@@ -320,7 +320,25 @@ class MainActivity : AppCompatActivity() {
         releasePlayer()
         videoPlayerView.visibility = View.VISIBLE
         imagePlayerView.visibility = View.GONE
-        exoPlayer = ExoPlayer.Builder(this).build().apply {
+
+        // This line checks the version of Android the phone is running
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+
+            // IF the phone is Android 11 or newer, this code runs.
+            // It creates the attribution context to fix the error on new devices.
+            val attributionTag = "mediaPlayback"
+            val attributionContext = createAttributionContext(attributionTag)
+            exoPlayer = ExoPlayer.Builder(attributionContext).build()
+
+        } else {
+
+            // IF the phone is older (like Android 7, 8, 9, or 10), this code runs.
+            // It creates the player the simple, old way, which works perfectly on these versions.
+            exoPlayer = ExoPlayer.Builder(this).build()
+        }
+
+        // The rest of the code is the same for all versions
+        exoPlayer?.apply {
             videoPlayerView.player = this
             setMediaItem(MediaItem.fromUri(item.url))
             addListener(object : Player.Listener {
