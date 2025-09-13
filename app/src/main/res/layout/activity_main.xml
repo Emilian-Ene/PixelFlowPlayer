@@ -49,7 +49,7 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="center"
-        android:indeterminateTint="@color/teal_text"
+        android:indeterminateTint="@android:color/white"
         android:visibility="gone"
         tools:visibility="visible" />
 
@@ -64,8 +64,7 @@
         android:background="?attr/selectableItemBackgroundBorderless"
         android:contentDescription="@string/exit_button_description"
         android:padding="8dp"
-        android:src="@drawable/ic_close"
-        app:tint="@android:color/white"
+        android:src="@drawable/ic_close_with_background"
         android:visibility="gone" />
 
     <!-- Player Container -->
@@ -95,7 +94,7 @@
         android:layout_height="32dp"
         android:layout_gravity="bottom|start"
         android:layout_margin="16dp"
-        android:src="@drawable/ic_offline_indicator"
+        android:src="@drawable/ic_offline_indicator_with_background"
         android:visibility="gone"
         android:contentDescription="@string/offline_indicator_description" />
 </FrameLayout>

@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">PixelFlowPlayer</string>
+    <string name="app_name">pixelflow.player</string>
     <string name="media_playback_attribution_label">Media Playback</string>
     <string name="pairing_url">app.pixelflow.com</string>
     <string name="pairing_instructions_unpaired">to pair the device and start using it</string>
     <string name="paired_title">Paired</string>
     <string name="pairing_instructions_paired">to assign content</string>
-    <string name="exit_dialog_title">Do you want to exit PixelFlowPlayer?</string>
+    <string name="exit_dialog_title">Do you want to exit pixelflow.player?</string>
     <string name="exit_dialog_exit_button">Exit</string>
     <string name="exit_dialog_cancel_button">Cancel</string>
     <string name="exit_button_description">Exit Application</string>

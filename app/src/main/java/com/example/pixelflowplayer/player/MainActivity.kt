@@ -38,6 +38,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.net.URL
 import java.util.*
+import androidx.core.view.isVisible
 
 class MainActivity : AppCompatActivity() {
 
@@ -62,6 +63,7 @@ class MainActivity : AppCompatActivity() {
     private var currentItemIndex = 0
     private val playerHandler = Handler(Looper.getMainLooper())
     private var heartbeatJob: Job? = null
+    private var flickerJob: Job? = null
     private val gson = Gson()
     private lateinit var connectivityManager: ConnectivityManager
     private var isNetworkCurrentlyConnected = false
@@ -123,7 +125,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateUI() {
         val currentlyPaired = sharedPreferences.getBoolean("isPaired", false)
-        offlineIndicator.visibility = if (isNetworkCurrentlyConnected) View.GONE else View.VISIBLE
+        flickerJob?.cancel()
+        if (isNetworkCurrentlyConnected) {
+            offlineIndicator.visibility = View.GONE
+        } else {
+            flickerJob = lifecycleScope.launch {
+                while (isActive) {
+                    withContext(Dispatchers.Main) {
+                        offlineIndicator.visibility = if (offlineIndicator.isVisible) View.INVISIBLE else View.VISIBLE
+                    }
+                    delay(10000)
+                }
+            }
+        }
 
         if (currentlyPaired) {
             val localPlaylist = getLocalPlaylist()
@@ -192,22 +206,55 @@ class MainActivity : AppCompatActivity() {
                                     releasePlayer()
                                     currentPlaylist = emptyList()
                                     withContext(Dispatchers.Main) { showPairedScreen() }
-                                }
+                                 }
                             }
                             "playing" -> {
-                                if (!wasPaired) {
+                                val wasPreviouslyPairedButWaiting = sharedPreferences.getBoolean("isPaired", false) && pairingView.isVisible
+                                if (!sharedPreferences.getBoolean("isPaired", false)) { // If it wasn't paired at all before
                                     sharedPreferences.edit { putBoolean("isPaired", true); remove(KEY_PENDING_PAIRING_CODE) }
                                     pairingCodeForHeartbeat = ""
                                 }
-                                val newPlaylist = heartbeatResponse.playlist
-                                val localPlaylist = getLocalPlaylist()
 
-                                if (newPlaylist != null && !newPlaylist.isContentEqualTo(localPlaylist)){
-                                    Log.d(TAG, "New playlist detected. Downloading content.")
-                                    withContext(Dispatchers.Main) { showPairedScreen() }
-                                    val downloadedPlaylist = downloadContentAndCreateLocalPlaylist(newPlaylist)
-                                    saveLocalPlaylist(downloadedPlaylist)
-                                    startPlayback(downloadedPlaylist)
+                                val newPlaylistFromServer = heartbeatResponse.playlist
+                                val currentLocalPlaylist = getLocalPlaylist() // Playlist from SharedPreferences
+
+                                if (newPlaylistFromServer != null && newPlaylistFromServer.items.isNotEmpty()) {
+                                    val playlistContentHasChanged = !newPlaylistFromServer.isContentEqualTo(currentLocalPlaylist)
+
+                                    if (playlistContentHasChanged) {
+                                        Log.d(TAG, "New or updated playlist detected. Downloading content.")
+                                        // Show a loading/paired screen briefly while downloading
+                                        withContext(Dispatchers.Main) { if (!playerContainer.isVisible) showPairedScreen() }
+                                        val downloadedPlaylist = downloadContentAndCreateLocalPlaylist(newPlaylistFromServer)
+                                        saveLocalPlaylist(downloadedPlaylist) // Save the new one to SharedPreferences
+                                        Log.d(TAG, "Download complete. Starting playback of new/updated playlist.")
+                                        startPlayback(downloadedPlaylist)
+                                    } else {
+                                        // Playlist content is the same as what's in SharedPreferences.
+                                        // If we were showing the pairing/waiting screen, or if the player is not active,
+                                        // we should start playback with this currentLocalPlaylist.
+                                        if (wasPreviouslyPairedButWaiting || exoPlayer == null || exoPlayer?.isPlaying == false) {
+                                            if (currentLocalPlaylist != null && currentLocalPlaylist.items.isNotEmpty()) {
+                                                Log.d(TAG, "Playlist content is same as local, but player was idle or in waiting screen. Starting playback.")
+                                                startPlayback(currentLocalPlaylist)
+                                            } else {
+                                                // This is an unlikely case: server says play, content is "same", but local is empty.
+                                                // Fallback to showing paired screen.
+                                                Log.w(TAG, "Playlist content same, but local is empty. Showing paired screen.")
+                                                withContext(Dispatchers.Main) { showPairedScreen() }
+                                            }
+                                        } else {
+                                            Log.d(TAG, "Playlist content is same as local, and player is already active. No change needed.")
+                                        }
+                                    }
+                                } else {
+                                    // Server said "playing" but sent no playlist or an empty one.
+                                    Log.w(TAG, "Received 'playing' status but no valid playlist in response.")
+                                    if (currentPlaylist.isNotEmpty()) { // If something was playing
+                                        releasePlayer()
+                                        currentPlaylist = emptyList()
+                                    }
+                                    withContext(Dispatchers.Main) { showPairedScreen() } // Go to "paired, waiting"
                                 }
                             }
                         }
@@ -282,7 +329,7 @@ class MainActivity : AppCompatActivity() {
         val jsonString = sharedPreferences.getString("localPlaylist", null) ?: return null
         return try {
             gson.fromJson(jsonString, Playlist::class.java)
-        } catch (e: Exception) { null }
+        } catch (e: Exception) { Log.e(TAG, "Error parsing local playlist from SharedPreferences", e); null }
     }
 
     private fun stopHeartbeat() {
@@ -370,12 +417,14 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         stopHeartbeat()
         releasePlayer()
+        flickerJob?.cancel()
     }
 
     private fun showLoadingScreen() {
         pairingView.visibility = View.GONE
         playerContainer.visibility = View.GONE
         loadingBar.visibility = View.VISIBLE
+        exitButton.visibility = View.GONE
     }
 
     private fun showPairingScreen(code: String, instruction: String) {
@@ -387,6 +436,7 @@ class MainActivity : AppCompatActivity() {
         instructionsText.visibility = View.VISIBLE
         mainStatusText.text = code
         instructionsText.text = instruction
+        exitButton.visibility = View.GONE
     }
 
     private fun showPairedScreen() {
@@ -398,6 +448,7 @@ class MainActivity : AppCompatActivity() {
         instructionsText.visibility = View.VISIBLE
         mainStatusText.text = getString(R.string.paired_title)
         instructionsText.text = getString(R.string.pairing_instructions_paired)
+        exitButton.visibility = View.GONE
     }
 
     private fun showPlayerScreen() {

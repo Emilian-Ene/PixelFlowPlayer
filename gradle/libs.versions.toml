@@ -1,7 +1,7 @@
 [versions]
-agp = "8.12.2"
-kotlin = "1.9.0"
-coreKtx = "1.12.0" # This version is managed by the BOM but we can specify it
+agp = "8.13.0"
+kotlin = "2.2.10"
+coreKtx = "1.12.0"
 junit = "4.13.2"
 androidxJunit = "1.1.5"
 espressoCore = "3.5.1"
@@ -13,14 +13,10 @@ media3 = "1.2.1"
 retrofit = "2.9.0"
 glide = "4.14.2"
 gson = "2.10.1"
-# --- NEW: Version for the Bill of Materials ---
 androidx-bom = "2024.02.01"
 
 [libraries]
-# --- NEW: The Bill of Materials library ---
 androidx-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "androidx-bom" }
-
-# --- Standard AndroidX Libraries (versions are now managed by the BOM) ---
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
 androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
 material = { group = "com.google.android.material", name = "material", version.ref = "material" }
@@ -29,15 +25,17 @@ junit = { group = "junit", name = "junit", version.ref = "junit" }
 androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "androidxJunit" }
 androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }
 androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycleRuntimeKtx" }
-
-# --- Our App's Required Libraries ---
 androidx-media3-exoplayer = { group = "androidx.media3", name = "media3-exoplayer", version.ref = "media3" }
 androidx-media3-ui = { group = "androidx.media3", name = "media3-ui", version.ref = "media3" }
 retrofit = { group = "com.squareup.retrofit2", name = "retrofit", version.ref = "retrofit" }
 converter-gson = { group = "com.squareup.retrofit2", name = "converter-gson", version.ref = "retrofit" }
-glide = { group = "com.github.bumptech.glide", name = "glide", version.ref = "glide" }
 gson = { group = "com.google.code.gson", name = "gson", version.ref = "gson" }
+glide = { group = "com.github.bumptech.glide", name = "glide", version.ref = "glide" }
+# --- ⬇️ ADD THIS LINE ⬇️ ---
+glide-compiler = { group = "com.github.bumptech.glide", name = "compiler", version.ref = "glide" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+# --- ⬇️ ADD THIS LINE ⬇️ ---
+kotlin-kapt = { id = "org.jetbrains.kotlin.kapt", version.ref = "kotlin" }
