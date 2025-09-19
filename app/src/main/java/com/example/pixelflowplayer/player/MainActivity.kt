@@ -2,6 +2,7 @@ package com.example.pixelflowplayer.player
 
 import android.annotation.SuppressLint
 import android.content.SharedPreferences
+import android.content.pm.ActivityInfo
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Build
@@ -15,15 +16,19 @@ import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.widget.FrameLayout
 import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.edit
+import androidx.core.view.isVisible
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.bumptech.glide.Glide
 import com.example.pixelflowplayer.R
@@ -38,9 +43,16 @@ import java.io.File
 import java.io.FileOutputStream
 import java.net.URL
 import java.util.*
-import androidx.core.view.isVisible
 
-class MainActivity : AppCompatActivity() {
+// Sealed class for download status reporting
+sealed class DownloadStatus {
+    data class Progress(val percentageComplete: Int, val itemsDownloaded: Int, val totalItems: Int, val currentItemName: String) : DownloadStatus()
+    data class ItemError(val itemName: String, val errorMessage: String) : DownloadStatus()
+    object Success : DownloadStatus() // Indicates all downloads completed successfully
+    data class Failed(val criticalErrorMessage: String) : DownloadStatus() // Indicates a failure that prevents playback
+}
+
+@UnstableApi class MainActivity : AppCompatActivity() {
 
     // --- Views ---
     private lateinit var rootLayout: FrameLayout
@@ -55,6 +67,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var videoPlayerView: PlayerView
     private lateinit var imagePlayerView: ImageView
     private lateinit var offlineIndicator: ImageView
+
+    // --- Download Progress Views ---
+    private lateinit var downloadProgressView: LinearLayout
+    private lateinit var downloadMainStatusText: TextView
+    private lateinit var downloadOverallProgressBar: ProgressBar
+    private lateinit var downloadProgressPercentageText: TextView
+    private lateinit var downloadItemsCountText: TextView
+    private lateinit var downloadErrorDetailsText: TextView
 
     // --- Logic ---
     private lateinit var sharedPreferences: SharedPreferences
@@ -73,6 +93,7 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val KEY_PENDING_PAIRING_CODE = "pendingPairingCode"
         private const val TAG = "PixelFlowPlayer"
+        private const val DOWNLOAD_BUFFER_SIZE = 8 * 1024 // 8KB buffer for downloads
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -101,7 +122,62 @@ class MainActivity : AppCompatActivity() {
         offlineIndicator = findViewById(R.id.offline_indicator)
         videoPlayerView = findViewById(R.id.video_player_view)
         imagePlayerView = findViewById(R.id.image_player_view)
+
+        // Download Progress Views
+        downloadProgressView = findViewById(R.id.download_progress_view)
+        downloadMainStatusText = findViewById(R.id.download_main_status_text)
+        downloadOverallProgressBar = findViewById(R.id.download_overall_progress_bar)
+        downloadProgressPercentageText = findViewById(R.id.download_progress_percentage_text)
+        downloadItemsCountText = findViewById(R.id.download_items_count_text)
+        downloadErrorDetailsText = findViewById(R.id.download_error_details_text)
     }
+
+    // --- Download UI Helper Functions ---
+    private fun showDownloadingScreen(totalItems: Int) {
+        pairingView.visibility = View.GONE
+        playerContainer.visibility = View.GONE
+        loadingBar.visibility = View.GONE
+        downloadProgressView.visibility = View.VISIBLE
+        exitButton.visibility = View.GONE
+
+        downloadMainStatusText.text = getString(R.string.download_preparing)
+        downloadOverallProgressBar.progress = 0
+        downloadOverallProgressBar.max = 100 // Should always be 100 for percentage
+        downloadProgressPercentageText.text = "0%"
+        downloadItemsCountText.text = getString(R.string.download_item_progress, 0, totalItems, "...")
+        downloadErrorDetailsText.text = ""
+        downloadErrorDetailsText.visibility = View.GONE
+    }
+
+    private fun updateDownloadProgressUI(status: DownloadStatus.Progress) {
+        downloadMainStatusText.text = getString(R.string.download_in_progress)
+        downloadOverallProgressBar.progress = status.percentageComplete
+        "${status.percentageComplete}%".also { downloadProgressPercentageText.text = it }
+        downloadItemsCountText.text = getString(R.string.download_item_progress, status.itemsDownloaded, status.totalItems, status.currentItemName)
+    }
+
+    private fun showDownloadItemErrorUI(status: DownloadStatus.ItemError) {
+        downloadMainStatusText.text = getString(R.string.download_errors_encountered)
+        val currentErrors = downloadErrorDetailsText.text.toString()
+        "$currentErrors\nError: ${status.itemName} - ${status.errorMessage}".trim()
+            .also { downloadErrorDetailsText.text = it }
+        downloadErrorDetailsText.visibility = View.VISIBLE
+    }
+
+    private fun showDownloadSuccessUI() {
+        downloadMainStatusText.text = getString(R.string.download_complete)
+        downloadOverallProgressBar.progress = 100
+        "100%".also { downloadProgressPercentageText.text = it }
+    }
+
+    private fun showDownloadFailedUI(status: DownloadStatus.Failed) {
+        downloadMainStatusText.text = getString(R.string.download_failed_critical)
+        downloadErrorDetailsText.text = status.criticalErrorMessage
+        downloadErrorDetailsText.visibility = View.VISIBLE
+        downloadOverallProgressBar.progress = 0
+        "Failed".also { downloadProgressPercentageText.text = it }
+    }
+    // --- End Download UI Helper Functions ---
 
     private fun setupNetworkMonitoring() {
         connectivityManager = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -124,6 +200,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateUI() {
+        if (downloadProgressView.isVisible) return
+
         val currentlyPaired = sharedPreferences.getBoolean("isPaired", false)
         flickerJob?.cancel()
         if (isNetworkCurrentlyConnected) {
@@ -178,7 +256,9 @@ class MainActivity : AppCompatActivity() {
             if (!sharedPreferences.getBoolean("isPaired", false)) {
                 pairingCodeForHeartbeat = getOrCreatePendingPairingCode()
                 withContext(Dispatchers.Main) {
-                    showPairingScreen(pairingCodeForHeartbeat, getString(R.string.pairing_instructions_unpaired))
+                    if (!downloadProgressView.isVisible) {
+                        showPairingScreen(pairingCodeForHeartbeat, getString(R.string.pairing_instructions_unpaired))
+                    }
                 }
             }
             while (isActive) {
@@ -201,45 +281,74 @@ class MainActivity : AppCompatActivity() {
                                 if (!wasPaired) {
                                     sharedPreferences.edit { putBoolean("isPaired", true); remove(KEY_PENDING_PAIRING_CODE) }
                                     pairingCodeForHeartbeat = ""
-                                    withContext(Dispatchers.Main) { showPairedScreen() }
-                                } else if (currentPlaylist.isNotEmpty()) {
-                                    releasePlayer()
-                                    currentPlaylist = emptyList()
-                                    withContext(Dispatchers.Main) { showPairedScreen() }
-                                 }
+                                }
+                                withContext(Dispatchers.Main) {
+                                    if (downloadProgressView.isVisible) downloadProgressView.visibility = View.GONE
+                                    if (currentPlaylist.isNotEmpty()) {
+                                        releasePlayer()
+                                        currentPlaylist = emptyList()
+                                    }
+                                    showPairedScreen()
+                                }
                             }
                             "playing" -> {
-                                val wasPreviouslyPairedButWaiting = sharedPreferences.getBoolean("isPaired", false) && pairingView.isVisible
-                                if (!sharedPreferences.getBoolean("isPaired", false)) { // If it wasn't paired at all before
+                                if (!sharedPreferences.getBoolean("isPaired", false)) {
                                     sharedPreferences.edit { putBoolean("isPaired", true); remove(KEY_PENDING_PAIRING_CODE) }
                                     pairingCodeForHeartbeat = ""
                                 }
 
                                 val newPlaylistFromServer = heartbeatResponse.playlist
-                                val currentLocalPlaylist = getLocalPlaylist() // Playlist from SharedPreferences
+                                val currentLocalPlaylist = getLocalPlaylist()
+
+                                // --- DIAGNOSTIC LOGGING ---
+                                Log.d(TAG, "DIAGNOSTIC: Server Playlist: ${gson.toJson(newPlaylistFromServer)}")
+                                Log.d(TAG, "DIAGNOSTIC: Local Playlist: ${gson.toJson(currentLocalPlaylist)}")
+                                // -------------------------
 
                                 if (newPlaylistFromServer != null && newPlaylistFromServer.items.isNotEmpty()) {
                                     val playlistContentHasChanged = !newPlaylistFromServer.isContentEqualTo(currentLocalPlaylist)
+                                    Log.d(TAG, "DIAGNOSTIC: Playlist content has changed: $playlistContentHasChanged") // Log the comparison result
 
                                     if (playlistContentHasChanged) {
-                                        Log.d(TAG, "New or updated playlist detected. Downloading content.")
-                                        // Show a loading/paired screen briefly while downloading
-                                        withContext(Dispatchers.Main) { if (!playerContainer.isVisible) showPairedScreen() }
-                                        val downloadedPlaylist = downloadContentAndCreateLocalPlaylist(newPlaylistFromServer)
-                                        saveLocalPlaylist(downloadedPlaylist) // Save the new one to SharedPreferences
-                                        Log.d(TAG, "Download complete. Starting playback of new/updated playlist.")
-                                        startPlayback(downloadedPlaylist)
+                                        Log.d(TAG, "New or updated playlist detected. Preparing to download content.")
+                                        withContext(Dispatchers.Main) {
+                                            showDownloadingScreen(newPlaylistFromServer.items.size)
+                                        }
+
+                                        val downloadedPlaylist = downloadContentAndCreateLocalPlaylist(newPlaylistFromServer) { status ->
+                                            withContext(Dispatchers.Main) {
+                                                when (status) {
+                                                    is DownloadStatus.Progress -> updateDownloadProgressUI(status)
+                                                    is DownloadStatus.ItemError -> showDownloadItemErrorUI(status)
+                                                    is DownloadStatus.Success -> showDownloadSuccessUI()
+                                                    is DownloadStatus.Failed -> showDownloadFailedUI(status)
+                                                }
+                                            }
+                                        }
+
+                                        if (downloadedPlaylist != null) {
+                                            saveLocalPlaylist(downloadedPlaylist)
+                                            Log.d(TAG, "Download complete. Starting playback of new/updated playlist.")
+                                            delay(2000)
+                                            startPlayback(downloadedPlaylist)
+                                        } else {
+                                            Log.e(TAG, "Playlist download failed or was incomplete. Not starting playback.")
+                                            delay(5000)
+                                            if (isActive) {
+                                                withContext(Dispatchers.Main) {
+                                                    showPairingScreen(getOrCreatePendingPairingCode(), getString(R.string.pairing_instructions_unpaired_after_fail))
+                                                }
+                                            }
+                                        }
                                     } else {
-                                        // Playlist content is the same as what's in SharedPreferences.
-                                        // If we were showing the pairing/waiting screen, or if the player is not active,
-                                        // we should start playback with this currentLocalPlaylist.
-                                        if (wasPreviouslyPairedButWaiting || exoPlayer == null || exoPlayer?.isPlaying == false) {
+                                        withContext(Dispatchers.Main) {
+                                            if (downloadProgressView.isVisible) downloadProgressView.visibility = View.GONE
+                                        }
+                                        if (exoPlayer == null || exoPlayer?.isPlaying == false) {
                                             if (currentLocalPlaylist != null && currentLocalPlaylist.items.isNotEmpty()) {
-                                                Log.d(TAG, "Playlist content is same as local, but player was idle or in waiting screen. Starting playback.")
+                                                Log.d(TAG, "Playlist content is same as local, but player was idle. Starting playback.")
                                                 startPlayback(currentLocalPlaylist)
                                             } else {
-                                                // This is an unlikely case: server says play, content is "same", but local is empty.
-                                                // Fallback to showing paired screen.
                                                 Log.w(TAG, "Playlist content same, but local is empty. Showing paired screen.")
                                                 withContext(Dispatchers.Main) { showPairedScreen() }
                                             }
@@ -248,13 +357,15 @@ class MainActivity : AppCompatActivity() {
                                         }
                                     }
                                 } else {
-                                    // Server said "playing" but sent no playlist or an empty one.
                                     Log.w(TAG, "Received 'playing' status but no valid playlist in response.")
-                                    if (currentPlaylist.isNotEmpty()) { // If something was playing
-                                        releasePlayer()
-                                        currentPlaylist = emptyList()
+                                    withContext(Dispatchers.Main) {
+                                        if (downloadProgressView.isVisible) downloadProgressView.visibility = View.GONE
+                                        if (currentPlaylist.isNotEmpty()) {
+                                            releasePlayer()
+                                            currentPlaylist = emptyList()
+                                        }
+                                        showPairedScreen()
                                     }
-                                    withContext(Dispatchers.Main) { showPairedScreen() } // Go to "paired, waiting"
                                 }
                             }
                         }
@@ -285,31 +396,102 @@ class MainActivity : AppCompatActivity() {
                 Log.e(TAG, "Failed to send immediate heartbeat on reset.", e)
             }
             withContext(Dispatchers.Main) {
+                downloadProgressView.visibility = View.GONE
                 updateUI()
             }
         }
     }
 
-    private suspend fun downloadContentAndCreateLocalPlaylist(remotePlaylist: Playlist): Playlist {
+    private suspend fun downloadContentAndCreateLocalPlaylist(
+        remotePlaylist: Playlist,
+        onProgressUpdate: suspend (DownloadStatus) -> Unit
+    ): Playlist? {
         val localItems = mutableListOf<PlaylistItem>()
         val newFileNames = mutableSetOf<String>()
+        var itemsSuccessfullyProcessed = 0
+        val totalItems = remotePlaylist.items.size
+        var lastReportedOverallPercentage = -1
+
+        onProgressUpdate(DownloadStatus.Progress(0, 0, totalItems, "Starting..."))
+
         withContext(Dispatchers.IO) {
             remotePlaylist.items.forEach { item ->
-                val fileName = item.url.substringAfterLast('/')
-                newFileNames.add(fileName)
-                val localFile = File(filesDir, fileName)
+                val itemName = item.url.substringAfterLast('/')
+                val initialOverallPercentage = (itemsSuccessfullyProcessed * 100) / totalItems
+                if (initialOverallPercentage > lastReportedOverallPercentage) {
+                    onProgressUpdate(
+                        DownloadStatus.Progress(
+                            initialOverallPercentage,
+                            itemsSuccessfullyProcessed,
+                            totalItems,
+                            "Checking: $itemName"
+                        )
+                    )
+                    lastReportedOverallPercentage = initialOverallPercentage
+                }
+
+                val localFile = File(filesDir, itemName)
+                newFileNames.add(itemName)
+
                 if (!localFile.exists()) {
                     try {
-                        URL(item.url).openStream().use { input ->
-                            FileOutputStream(localFile).use { output -> input.copyTo(output) }
+                        onProgressUpdate(DownloadStatus.Progress(initialOverallPercentage, itemsSuccessfullyProcessed, totalItems, "Downloading: $itemName"))
+                        val connection = URL(item.url).openConnection()
+                        val fileSize = connection.contentLengthLong
+                        var bytesCopied = 0L
+
+                        connection.getInputStream().use { input ->
+                            FileOutputStream(localFile).use { output ->
+                                val buffer = ByteArray(DOWNLOAD_BUFFER_SIZE)
+                                var bytes = input.read(buffer)
+                                while (bytes >= 0) {
+                                    output.write(buffer, 0, bytes)
+                                    bytesCopied += bytes
+                                    bytes = input.read(buffer)
+
+                                    val currentItemPercentage = if (fileSize > 0) ((bytesCopied * 100) / fileSize).toInt() else 0
+                                    val overallPercentageFromCompleted = (itemsSuccessfullyProcessed * 100)
+                                    val overallPercentage = (overallPercentageFromCompleted + currentItemPercentage) / totalItems
+
+                                    if (overallPercentage > lastReportedOverallPercentage) {
+                                        onProgressUpdate(DownloadStatus.Progress(overallPercentage, itemsSuccessfullyProcessed, totalItems, "Downloading: $itemName ($currentItemPercentage%)"))
+                                        lastReportedOverallPercentage = overallPercentage
+                                    }
+                                }
+                            }
                         }
-                    } catch (e: Exception) { Log.e(TAG, "Download failed for ${item.url}", e) }
+                        Log.d(TAG, "Download complete for ${item.url}")
+                        itemsSuccessfullyProcessed++
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Download failed for ${item.url}", e)
+                        localFile.delete()
+                        onProgressUpdate(DownloadStatus.ItemError(itemName, e.localizedMessage ?: "Unknown error"))
+                        onProgressUpdate(DownloadStatus.Failed("Critical error: Failed to download: $itemName. Aborting playlist."))
+                        return@withContext
+                    }
+                } else {
+                    Log.d(TAG, "File already exists: $itemName")
+                    itemsSuccessfullyProcessed++
+                    val overallPercentage = (itemsSuccessfullyProcessed * 100) / totalItems
+                    if (overallPercentage > lastReportedOverallPercentage) {
+                        onProgressUpdate(DownloadStatus.Progress(overallPercentage, itemsSuccessfullyProcessed, totalItems, "Exists: $itemName"))
+                        lastReportedOverallPercentage = overallPercentage
+                    }
                 }
                 localItems.add(item.copy(url = localFile.toURI().toString()))
             }
             cleanupOldFiles(newFileNames)
         }
-        return Playlist(items = localItems)
+
+        return if (itemsSuccessfullyProcessed == totalItems && localItems.size == totalItems) {
+            onProgressUpdate(DownloadStatus.Success)
+            Playlist(items = localItems, orientation = remotePlaylist.orientation)
+        } else {
+            if (itemsSuccessfullyProcessed < totalItems) {
+                onProgressUpdate(DownloadStatus.Failed("Not all playlist items could be processed."))
+            }
+            null
+        }
     }
 
     private fun cleanupOldFiles(currentFileNames: Set<String>) {
@@ -343,6 +525,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun startPlayback(playlist: Playlist) {
         runOnUiThread {
+            setScreenOrientation(playlist.orientation) // Set orientation
+            downloadProgressView.visibility = View.GONE
             if (playerContainer.visibility != View.VISIBLE) showPlayerScreen()
             currentPlaylist = playlist.items
             currentItemIndex = 0
@@ -353,7 +537,7 @@ class MainActivity : AppCompatActivity() {
     private fun playNextItem() {
         if (currentPlaylist.isEmpty()) return
         if (currentItemIndex >= currentPlaylist.size) {
-            currentItemIndex = 0
+            currentItemIndex = 0 // Loop playlist
         }
         val item = currentPlaylist[currentItemIndex]
         currentItemIndex++
@@ -368,23 +552,22 @@ class MainActivity : AppCompatActivity() {
         videoPlayerView.visibility = View.VISIBLE
         imagePlayerView.visibility = View.GONE
 
-        // This line checks the version of Android the phone is running
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        // --- NEW: Set Resize Mode based on displayMode ---
+        videoPlayerView.resizeMode = when (item.displayMode?.lowercase()) {
+            "cover" -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+            "fill" -> AspectRatioFrameLayout.RESIZE_MODE_FILL
+            "contain" -> AspectRatioFrameLayout.RESIZE_MODE_FIT
+            else -> AspectRatioFrameLayout.RESIZE_MODE_FIT // Default
+        }
 
-            // IF the phone is Android 11 or newer, this code runs.
-            // It creates the attribution context to fix the error on new devices.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val attributionTag = "mediaPlayback"
             val attributionContext = createAttributionContext(attributionTag)
             exoPlayer = ExoPlayer.Builder(attributionContext).build()
-
         } else {
-
-            // IF the phone is older (like Android 7, 8, 9, or 10), this code runs.
-            // It creates the player the simple, old way, which works perfectly on these versions.
             exoPlayer = ExoPlayer.Builder(this).build()
         }
 
-        // The rest of the code is the same for all versions
         exoPlayer?.apply {
             videoPlayerView.player = this
             setMediaItem(MediaItem.fromUri(item.url))
@@ -403,8 +586,26 @@ class MainActivity : AppCompatActivity() {
         releasePlayer()
         videoPlayerView.visibility = View.GONE
         imagePlayerView.visibility = View.VISIBLE
+
+        // --- NEW: Set Scale Type based on displayMode ---
+        imagePlayerView.scaleType = when (item.displayMode?.lowercase()) {
+            "cover" -> ImageView.ScaleType.CENTER_CROP
+            "fill" -> ImageView.ScaleType.FIT_XY
+            "contain" -> ImageView.ScaleType.FIT_CENTER
+            else -> ImageView.ScaleType.FIT_CENTER // Default
+        }
+
         Glide.with(this).load(item.url).into(imagePlayerView)
         playerHandler.postDelayed({ playNextItem() }, item.duration * 1000L)
+    }
+
+    // --- NEW: Function to control screen orientation ---
+    private fun setScreenOrientation(orientation: String?) {
+        requestedOrientation = when (orientation?.lowercase()) {
+            "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            "landscape" -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            else -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE // Default
+        }
     }
 
     private fun releasePlayer() {
@@ -423,6 +624,7 @@ class MainActivity : AppCompatActivity() {
     private fun showLoadingScreen() {
         pairingView.visibility = View.GONE
         playerContainer.visibility = View.GONE
+        downloadProgressView.visibility = View.GONE
         loadingBar.visibility = View.VISIBLE
         exitButton.visibility = View.GONE
     }
@@ -430,6 +632,7 @@ class MainActivity : AppCompatActivity() {
     private fun showPairingScreen(code: String, instruction: String) {
         playerContainer.visibility = View.GONE
         loadingBar.visibility = View.GONE
+        downloadProgressView.visibility = View.GONE
         pairingView.visibility = View.VISIBLE
         mainStatusText.visibility = View.VISIBLE
         urlText.visibility = View.VISIBLE
@@ -442,6 +645,7 @@ class MainActivity : AppCompatActivity() {
     private fun showPairedScreen() {
         playerContainer.visibility = View.GONE
         loadingBar.visibility = View.GONE
+        downloadProgressView.visibility = View.GONE
         pairingView.visibility = View.VISIBLE
         mainStatusText.visibility = View.VISIBLE
         urlText.visibility = View.VISIBLE
@@ -454,6 +658,7 @@ class MainActivity : AppCompatActivity() {
     private fun showPlayerScreen() {
         pairingView.visibility = View.GONE
         loadingBar.visibility = View.GONE
+        downloadProgressView.visibility = View.GONE
         playerContainer.visibility = View.VISIBLE
     }
 

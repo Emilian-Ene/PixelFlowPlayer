@@ -1,6 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- ... your existing colors like purple_200, purple_500, etc. ... -->
+
+    <color name="teal_200">#FF03DAC5</color>  <!-- Standard Teal 200 -->
+    <color name="teal_700">#FF018786</color>  <!-- Standard Teal 700 (often used with 200) -->
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
-    <color name="teal_text">#33E1C1</color>
+    <color name="teal_text">#FF00796B</color> <!-- Your existing teal_text -->
+    <color name="dark_red_error">#FFC00000</color>
+    <!-- Add any other custom colors you have -->
 </resources>

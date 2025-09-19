@@ -2,7 +2,7 @@
 <resources>
     <string name="app_name">pixelflow.player</string>
     <string name="media_playback_attribution_label">Media Playback</string>
-    <string name="pairing_url">app.pixelflow.com</string>
+    <string name="pairing_url">pixelflow.com</string>
     <string name="pairing_instructions_unpaired">to pair the device and start using it</string>
     <string name="paired_title">Paired</string>
     <string name="pairing_instructions_paired">to assign content</string>
@@ -12,4 +12,16 @@
     <string name="exit_button_description">Exit Application</string>
     <string name="image_player_description">Displayed image content</string>
     <string name="offline_indicator_description">Offline indicator icon</string>
+
+        <!-- ... your existing strings ... -->
+
+        <!-- Download Progress Strings -->
+        <string name="download_preparing">Preparing to download…</string>
+        <string name="download_in_progress">Downloading playlist…</string>
+        <string name="download_item_progress">Item %1$d of %2$d: %3$s</string> <!-- For "Item 1 of 5: video.mp4" -->
+        <string name="download_errors_encountered">Download errors encountered</string>
+        <string name="download_complete">Playlist download complete!</string>
+        <string name="download_failed_critical">Critical Download Failure</string>
+        <string name="pairing_instructions_unpaired_after_fail">Pairing code. Download failed, please check connection or content and retry pairing.</string>
+
 </resources>
