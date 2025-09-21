@@ -6,28 +6,26 @@ import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.Body
 import retrofit2.http.POST
 
-// Data class for the request body the app will SEND
+// Request body sent by the app
 data class HeartbeatRequest(
     val deviceId: String,
-    val pairingCode: String
+    val pairingCode: String = "" // default empty is OK
 )
 
-// Data class for the response the app EXPECTS to receive
+// Response body returned by backend
 data class HeartbeatResponse(
     val status: String,
-    val playlist: Playlist? // The '?' means this can be null
+    val playlist: Playlist?, // nullable
+    val rotation: Int?       // nullable
 )
 
-// The interface defining our API endpoint
 interface ApiService {
-    @POST("devices/heartbeat") // Relative path to the base URL
+    @POST("devices/heartbeat")
     suspend fun deviceHeartbeat(@Body request: HeartbeatRequest): Response<HeartbeatResponse>
 }
 
-// A separate object to create and provide the ApiService instance
 object ApiClient {
-    // IMPORTANT: Make sure this is your correct backend address and port
-    // Base URL now ends with a slash, and the specific endpoint path is in the @POST annotation
+    // Update to your backend IP/host if needed
     private const val BASE_URL = "http://192.168.1.151:3000/api/"
 
     private val retrofit = Retrofit.Builder()
@@ -35,6 +33,5 @@ object ApiClient {
         .addConverterFactory(GsonConverterFactory.create())
         .build()
 
-    // This is the variable that MainActivity will access
     val apiService: ApiService = retrofit.create(ApiService::class.java)
 }

@@ -305,6 +305,11 @@ sealed class DownloadStatus {
                                 Log.d(TAG, "DIAGNOSTIC: Local Playlist: ${gson.toJson(currentLocalPlaylist)}")
                                 // -------------------------
 
+                                if (newPlaylistFromServer != null) {
+                                    withContext(Dispatchers.Main) { applyPlaylistOrientation(newPlaylistFromServer.orientation) }
+                                    withContext(Dispatchers.Main) { applyContentRotation(heartbeatResponse.rotation ?: 0) }
+                                }
+
                                 if (newPlaylistFromServer != null && newPlaylistFromServer.items.isNotEmpty()) {
                                     val playlistContentHasChanged = !newPlaylistFromServer.isContentEqualTo(currentLocalPlaylist)
                                     Log.d(TAG, "DIAGNOSTIC: Playlist content has changed: $playlistContentHasChanged") // Log the comparison result
@@ -523,9 +528,34 @@ sealed class DownloadStatus {
         return (1..6).map { (('A'..'Z') + ('0'..'9')).random() }.joinToString("")
     }
 
+    // Apply device orientation based on Playlist orientation (Landscape/Portrait/Custom)
+    private fun applyPlaylistOrientation(orientation: String?) {
+        val target = when (orientation?.lowercase()) {
+            "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            "landscape" -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            "custom" -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        }
+        if (target != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED && requestedOrientation != target) {
+            Log.d(TAG, "Applying Playlist orientation='$orientation' -> requestedOrientation=$target")
+            requestedOrientation = target
+        }
+    }
+
+    // Rotate media elements (video/image) inside the canvas. Canvas stays the same.
+    private fun applyContentRotation(rotationDegrees: Int) {
+        val norm = ((rotationDegrees % 360) + 360) % 360
+        Log.d(TAG, "Applying content rotation=${norm}° to media views")
+        // Post to ensure views have been laid out
+        videoPlayerView.post { videoPlayerView.rotation = norm.toFloat() }
+        imagePlayerView.post { imagePlayerView.rotation = norm.toFloat() }
+        // Keep container unrotated
+        playerContainer.rotation = 0f
+    }
+
     private fun startPlayback(playlist: Playlist) {
         runOnUiThread {
-            setScreenOrientation(playlist.orientation) // Set orientation
+            applyPlaylistOrientation(playlist.orientation)
             downloadProgressView.visibility = View.GONE
             if (playerContainer.visibility != View.VISIBLE) showPlayerScreen()
             currentPlaylist = playlist.items
@@ -597,15 +627,6 @@ sealed class DownloadStatus {
 
         Glide.with(this).load(item.url).into(imagePlayerView)
         playerHandler.postDelayed({ playNextItem() }, item.duration * 1000L)
-    }
-
-    // --- NEW: Function to control screen orientation ---
-    private fun setScreenOrientation(orientation: String?) {
-        requestedOrientation = when (orientation?.lowercase()) {
-            "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-            "landscape" -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-            else -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE // Default
-        }
     }
 
     private fun releasePlayer() {
