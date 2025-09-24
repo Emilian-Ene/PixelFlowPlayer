@@ -250,7 +250,14 @@ class DownloadManager(
         val request = task.request
         var attempt = 0
         var lastError: String? = null
-        
+
+        // Debug hook: allow forced failure for testing via metadata
+        if (request.metadata["simulateFail"] == "true") {
+            updateProgress(request.url, DownloadProgress.Failed("Simulated failure (debug)"))
+            onDownloadComplete(request.url)
+            return
+        }
+
         updateProgress(request.url, DownloadProgress.InProgress(0f, "Starting download..."))
         
         while (attempt < MAX_DOWNLOAD_ATTEMPTS && task.isActive) {
@@ -267,6 +274,7 @@ class DownloadManager(
                     is DownloadResult.Success -> {
                         Log.d(TAG, "Download successful: ${request.url}")
                         updateProgress(request.url, DownloadProgress.Completed(result.filePath))
+                        onDownloadComplete(request.url)
                         return
                     }
                     is DownloadResult.Error -> {
@@ -290,6 +298,7 @@ class DownloadManager(
         
         if (task.isActive) {
             updateProgress(request.url, DownloadProgress.Failed(lastError ?: "Unknown error"))
+            onDownloadComplete(request.url)
         }
     }
     

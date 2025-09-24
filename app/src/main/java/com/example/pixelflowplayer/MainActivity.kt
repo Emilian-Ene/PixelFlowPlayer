@@ -854,7 +854,11 @@ class MainActivity : AppCompatActivity() {
         errors: List<String>
     ) {
         if (downloadProgressView.isVisible) {
-            downloadMainStatusText.text = getString(R.string.download_overlay_downloading_item, currentItemName)
+            val msg = if (currentItemName.isNotBlank())
+                getString(R.string.download_overlay_downloading_item, currentItemName)
+            else
+                getString(R.string.download_overlay_downloading)
+            downloadMainStatusText.text = msg
             downloadOverallProgressBar.progress = percent
             downloadProgressPercentageText.text = "$percent%"
             downloadItemsCountText.text = "$completed / $total"
