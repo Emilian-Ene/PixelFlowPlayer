@@ -1,5 +1,8 @@
 package com.example.pixelflowplayer
 
+import android.app.AlertDialog
+import android.app.admin.DevicePolicyManager
+import android.content.Context
 import android.annotation.SuppressLint
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
@@ -10,6 +13,8 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
@@ -17,6 +22,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import android.widget.Toast
 import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.edit
@@ -109,6 +115,11 @@ class MainActivity : AppCompatActivity() {
     // Guard and job for download-complete handoff to playback
     private var downloadProgressJob: Job? = null
     private var playbackStartedFromDownloads = false
+    private var isBlockingOnDownload: Boolean = false
+
+    // Transient controls (exit button) visibility handler
+    private val controlsHandler = Handler(Looper.getMainLooper())
+    private val hideControlsRunnable = Runnable { exitButton.visibility = View.GONE }
 
     // Prevent starting a new update while a previous update is in progress
     private var playlistUpdateInProgress = false
@@ -132,6 +143,8 @@ class MainActivity : AppCompatActivity() {
 
         // Initialize views (restored from old file)
         findViews()
+        exitButton.visibility = View.GONE // controls are transient; shown on user interaction
+        exitButton.bringToFront()
         setupFullscreen()
         setupInteractions()
 
@@ -359,9 +372,23 @@ class MainActivity : AppCompatActivity() {
 
                                 val newPlaylistFromServer = heartbeatResponse.playlist
 
+                                // Ensure the paired screen is hidden as soon as content is assigned
+                                withContext(Dispatchers.Main) { pairingView.visibility = View.GONE }
+
                                 if (newPlaylistFromServer != null) {
                                     withContext(Dispatchers.Main) { applyPlaylistOrientation(newPlaylistFromServer.orientation) }
                                     withContext(Dispatchers.Main) { applyContentRotation(heartbeatResponse.rotation ?: 0) }
+                                }
+
+                                // If CMS assigned an empty playlist, go back to paired/waiting screen
+                                if (newPlaylistFromServer != null && newPlaylistFromServer.items.isEmpty()) {
+                                    withContext(Dispatchers.Main) {
+                                        stopVideoPlayback()
+                                        currentPlaylistItems = emptyList()
+                                        currentItemIndex = 0
+                                        getSharedPreferences("PixelFlowPlayerPrefs", MODE_PRIVATE).edit { remove("localPlaylist") }
+                                        showPairedScreen()
+                                    }
                                 }
 
                                 if (newPlaylistFromServer != null && newPlaylistFromServer.items.isNotEmpty()) {
@@ -372,11 +399,19 @@ class MainActivity : AppCompatActivity() {
                                         withContext(Dispatchers.Main) {
                                             downloadAndPlayPlaylist(newPlaylistFromServer)
                                         }
-                                    } else if (!playlistContentHasChanged && currentPlaylistItems.isEmpty()) {
-                                        Log.d(TAG, getString(R.string.log_player_idle))
+                                    } else if (!playlistContentHasChanged) {
                                         val localPlaylist = getLocalPlaylist()
-                                        if (localPlaylist != null && localPlaylist.items.isNotEmpty()) {
-                                            startPlayback(localPlaylist)
+                                        val playable = localPlaylist?.let { buildLocalPlaylistFromCache(it) }
+                                        val hasPlayable = playable != null && playable.items.isNotEmpty()
+
+                                        if (currentPlaylistItems.isEmpty() || !hasPlayable) {
+                                            Log.d(TAG, getString(R.string.log_player_idle))
+                                            // Force download/start because cache was likely cleared after paired_waiting
+                                            withContext(Dispatchers.Main) {
+                                                downloadAndPlayPlaylist(newPlaylistFromServer, force = true)
+                                            }
+                                        } else if (currentPlaylistItems.isEmpty() && hasPlayable) {
+                                            withContext(Dispatchers.Main) { startPlayback(playable!!) }
                                         }
                                     }
                                 } else if (heartbeatResponse.playlist == null) {
@@ -390,6 +425,11 @@ class MainActivity : AppCompatActivity() {
                         }
                     } else {
                         Log.w(TAG, "Heartbeat Error: ${response.code()}")
+                        // If the device was deleted from CMS, backend may respond 404/410.
+                        // Force a reset to pairing state so a new PIN is shown.
+                        if (response.code() == 404 || response.code() == 410) {
+                            handleUnpairingAndReset(); return@launch
+                        }
                     }
                 } catch (e: Exception) {
                     if (isActive) Log.e(TAG, "Heartbeat Exception: ${e.message}")
@@ -453,17 +493,13 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Build a local playlist that rewrites URLs to file:// cached paths, skipping non-cached items
+    // Build a local playlist that rewrites URLs to file:// cached paths, keeping remote URL when not cached
     private fun buildLocalPlaylistFromCache(source: Playlist): Playlist {
-        val mapped = source.items.mapNotNull { item ->
+        val mapped = source.items.map { item ->
             val remoteUrl = if (item.url.startsWith("http") || item.url.startsWith("file://")) item.url else "$BASE_URL${item.url}"
             val file = storageManager.getCacheFile(remoteUrl)
-            if (file.exists() && file.length() > 0) {
-                item.copy(url = "file://${file.absolutePath}")
-            } else {
-                Log.w(TAG, "Item excluded from local playlist, file not found in cache: ${item.url}")
-                null // Exclude this item
-            }
+            val localOrRemote = if (file.exists() && file.length() > 0) "file://${file.absolutePath}" else remoteUrl
+            item.copy(url = localOrRemote)
         }
         return Playlist(items = mapped, orientation = source.orientation, transitionType = source.transitionType)
     }
@@ -471,8 +507,8 @@ class MainActivity : AppCompatActivity() {
     /**
      * 📥 Download all playlist items first, then start playback (enhanced for Playlist object)
      */
-    private fun downloadAndPlayPlaylist(newPlaylist: Playlist) {
-        if (lastRemotePlaylist?.isContentEqualTo(newPlaylist) == true) {
+    private fun downloadAndPlayPlaylist(newPlaylist: Playlist, force: Boolean = false) {
+        if (!force && lastRemotePlaylist?.isContentEqualTo(newPlaylist) == true) {
             Log.d(TAG, getString(R.string.log_playlist_unchanged))
             playlistUpdateInProgress = false
             return
@@ -480,11 +516,11 @@ class MainActivity : AppCompatActivity() {
         lastRemotePlaylist = newPlaylist
 
         playlistUpdateInProgress = true
-        val isPlaybackActive = currentPlaylistItems.isNotEmpty() && playerContainer.isVisible
 
         if (newPlaylist.items.isEmpty()) {
             Log.w(TAG, getString(R.string.log_no_items_to_download))
             statusText.text = getString(R.string.status_no_items_to_play)
+            showPairedScreen()
             playlistUpdateInProgress = false
             return
         }
@@ -500,22 +536,19 @@ class MainActivity : AppCompatActivity() {
             }.toSet()
 
             withContext(Dispatchers.Main) {
-                if (missingUrls.isEmpty()) {
-                    handleAllItemsCached(newPlaylist, allTargetUrls)
-                    return@withContext
-                }
-
-                if (!isPlaybackActive) {
-                    showDownloadOverlay(missingUrls.size)
-                } else {
-                    Log.d(TAG, "Starting background download for new playlist...")
-                }
+                // Always show blocking download splash until 100% ready
+                isBlockingOnDownload = true
+                stopVideoPlayback()
+                playerContainer.visibility = View.GONE
+                showDownloadOverlay(allTargetUrls.size)
 
                 saveLocalPlaylist(newPlaylist)
                 playbackStartedFromDownloads = false
                 downloadProgressJob?.cancel()
-                monitorDownloadProgress(missingUrls, isPlaybackActive)
+                // Track ALL items; cached ones will be counted as completed
+                monitorDownloadProgress(allTargetUrls)
 
+                // Launch downloads only for the missing ones
                 queueDownloads(newPlaylist, missingUrls, allTargetUrls)
             }
         }
@@ -569,7 +602,7 @@ class MainActivity : AppCompatActivity() {
     /**
      * 🔄 Monitor download progress and start playback when ready
      */
-    private fun monitorDownloadProgress(urlsToTrack: Set<String>, isBackgroundDownload: Boolean) {
+    private fun monitorDownloadProgress(urlsToTrack: Set<String>) {
         downloadProgressJob?.cancel()
         downloadProgressJob = CoroutineScope(Dispatchers.IO).launch {
             val errors = mutableListOf<String>()
@@ -581,27 +614,22 @@ class MainActivity : AppCompatActivity() {
                     }
                     val failedCount = urlsToTrack.count { url -> progressMap[url] is DownloadProgress.Failed }
 
-                    if (!isBackgroundDownload) {
-                        val percent = if (urlsToTrack.isNotEmpty()) (completedCount * 100) / urlsToTrack.size else 100
-                        val currentName = progressMap.entries.firstOrNull { it.value is DownloadProgress.InProgress }?.key?.substringAfterLast('/') ?: ""
-                        withContext(Dispatchers.Main) {
-                            updateDownloadOverlay(completedCount, urlsToTrack.size, percent, currentName, errors)
-                        }
+                    val percent = if (urlsToTrack.isNotEmpty()) (completedCount * 100) / urlsToTrack.size else 100
+                    val currentName = progressMap.entries.firstOrNull { it.value is DownloadProgress.InProgress }?.key?.substringAfterLast('/') ?: ""
+                    withContext(Dispatchers.Main) {
+                        updateDownloadOverlay(completedCount, urlsToTrack.size, percent, currentName, errors)
                     }
 
-                    if (completedCount + failedCount >= urlsToTrack.size) {
-                        Log.d(TAG, "Download process finished. Completed: $completedCount, Failed: $failedCount")
+                    if (failedCount == 0 && completedCount >= urlsToTrack.size) {
+                        Log.d(TAG, "All downloads complete. Releasing player.")
                         val freshPlaylist = getLocalPlaylist()?.let { buildLocalPlaylistFromCache(it) }
-                        if (freshPlaylist != null && freshPlaylist.items.isNotEmpty()) {
-                            withContext(Dispatchers.Main) {
+                        withContext(Dispatchers.Main) {
+                            isBlockingOnDownload = false
+                            hideDownloadOverlay()
+                            if (freshPlaylist != null && freshPlaylist.items.isNotEmpty()) {
                                 startPlayback(freshPlaylist)
-                            }
-                        } else {
-                            Log.e(TAG, "Download finished, but no playable local content found.")
-                            if (!isBackgroundDownload) {
-                                withContext(Dispatchers.Main) {
-                                    showPairedScreen(instructions = "Failed to load content.")
-                                }
+                            } else {
+                                showPairedScreen(instructions = "Failed to load content.")
                             }
                         }
                         playlistUpdateInProgress = false
@@ -621,36 +649,28 @@ class MainActivity : AppCompatActivity() {
             showPairedScreen()
             return
         }
-
-        // Avoid multiple timers from previous items
         handler.removeCallbacksAndMessages(null)
-
-        // Make sure the central spinner is hidden between items
         loadingBar.visibility = View.GONE
-
-        // Ensure any download overlay is hidden once we actually start playback
-        hideDownloadOverlay()
+        if (!isBlockingOnDownload) hideDownloadOverlay()
+        playerContainer.visibility = View.VISIBLE
+        playerContainer.bringToFront()
 
         val item = currentPlaylistItems[currentItemIndex]
 
-        // Strict check for local file URI
-        if (!item.url.startsWith("file://")) {
-            Log.e(TAG, "Player error: Attempted to play a non-local item: ${item.url}. Skipping.")
-            // Use handler to avoid stack overflow if all items are bad
-            handler.post { advanceToNextItem() }
-            return
-        }
-
         Log.d(TAG, "🎬 Playing item ${currentItemIndex + 1}/${currentPlaylistItems.size}: ${item.url}")
 
-        // Use per-item Media Fit if provided; otherwise fall back to global
         val effectiveDisplayMode = item.displayMode ?: displayMode
 
         // Cancel any pending image advance
         imageAdvanceRunnable?.let { imagePlayerView.removeCallbacks(it) }
         imageAdvanceRunnable = null
 
-        val uri = item.url
+        // Resolve to file:// if present, otherwise use absolute HTTP(S) URL (fallback streaming)
+        val uri = when {
+            item.url.startsWith("file://") -> item.url
+            item.url.startsWith("http") -> item.url
+            else -> "$BASE_URL${item.url}"
+        }
 
         if (item.type.equals("image", true)) {
             // Single-image playlist: keep it on screen without refreshing
@@ -667,7 +687,7 @@ class MainActivity : AppCompatActivity() {
             }
             Glide.with(this)
                 .load(uri)
-                .skipMemoryCache(true) // Force reload from disk to adapt to new view size
+                .skipMemoryCache(true)
                 .into(imagePlayerView)
 
             val r = Runnable { advanceToNextItem() }
@@ -716,7 +736,7 @@ class MainActivity : AppCompatActivity() {
     private fun startPlayback(playlist: Playlist) {
         runOnUiThread {
             applyPlaylistOrientation(playlist.orientation)
-            hideDownloadOverlay()
+            if (!isBlockingOnDownload) hideDownloadOverlay()
             if (playerContainer.visibility != View.VISIBLE) showPlayerScreen()
 
             currentPlaylistItems = playlist.items
@@ -738,19 +758,51 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupInteractions() {
-        // Implementation needed
+        // Exit button: confirmation dialog
+        exitButton.isClickable = true
+        exitButton.setOnClickListener { showExitConfirmDialog() }
+
+        // Show transient controls on any user interaction
+        val touchListener = View.OnTouchListener { _, _ ->
+            showTransientControls(); false
+        }
+        rootLayout.setOnTouchListener(touchListener)
+        playerView.setOnTouchListener(touchListener)
+        imagePlayerView.setOnTouchListener(touchListener)
     }
 
-    private fun initializePlayer() {
-        exoPlayer = ExoPlayer.Builder(this).build()
-        playerView.player = exoPlayer
-        exoPlayer?.addListener(object : Player.Listener {
-            override fun onPlaybackStateChanged(playbackState: Int) {
-                if (playbackState == Player.STATE_ENDED) {
-                    advanceToNextItem()
-                }
+    override fun onUserInteraction() {
+        super.onUserInteraction()
+        showTransientControls()
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN) showTransientControls()
+        return super.dispatchKeyEvent(event)
+    }
+
+    private fun showTransientControls() {
+        exitButton.visibility = View.VISIBLE
+        exitButton.bringToFront()
+        controlsHandler.removeCallbacks(hideControlsRunnable)
+        controlsHandler.postDelayed(hideControlsRunnable, 10_000)
+    }
+
+    private fun showExitConfirmDialog() {
+        showTransientControls()
+        AlertDialog.Builder(this)
+            .setMessage(getString(R.string.exit_confirm_message))
+            .setPositiveButton(getString(R.string.action_yes)) { _, _ ->
+                try { stopLockTask() } catch (_: Exception) {}
+                try { exoPlayer?.release() } catch (_: Exception) {}
+                finishAndRemoveTask(); finishAffinity()
             }
-        })
+            .setNegativeButton(getString(R.string.action_no)) { dialog, _ ->
+                dialog.dismiss()
+                showTransientControls()
+            }
+            .setCancelable(true)
+            .show()
     }
 
     private fun showPairedScreen(pairingCode: String? = null, instructions: String? = null) {
@@ -760,6 +812,8 @@ class MainActivity : AppCompatActivity() {
         loadingBar.visibility = View.GONE
         mainStatusText.text = pairingCode ?: getString(R.string.paired_screen_paired)
         instructionsText.text = instructions ?: getString(R.string.paired_screen_waiting_for_content)
+        exitButton.bringToFront()
+        // keep controls transient; don't force visible here
         stopLockTask()
     }
 
@@ -769,36 +823,22 @@ class MainActivity : AppCompatActivity() {
         downloadProgressView.visibility = View.GONE
         loadingBar.visibility = View.VISIBLE
         mainStatusText.text = getString(R.string.loading_screen_loading)
+        exitButton.bringToFront()
     }
 
-    private fun stopVideoPlayback() {
-        exoPlayer?.stop()
-        exoPlayer?.clearMediaItems()
-    }
-
-    private fun applyPlaylistOrientation(orientation: String?) {
-        val normalized = orientation?.trim()?.lowercase() // CMS may send 'Landscape'/'Portrait'
-        val newOrientation = when (normalized) {
-            "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-            "landscape" -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-            else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-        }
-        if (requestedOrientation != newOrientation) {
-            Log.d(TAG, "Requesting orientation change to: ${normalized ?: "unspecified"}")
-            requestedOrientation = newOrientation
-        }
-    }
-
-    @SuppressLint("SetTextI18n")
     private fun showDownloadOverlay(
         missing: Int
     ) {
+        // Hide other UI layers while we block for downloads
+        pairingView.visibility = View.GONE
+        playerContainer.visibility = View.GONE
         downloadProgressView.visibility = View.VISIBLE
         downloadMainStatusText.text = getString(R.string.download_overlay_downloading)
         downloadOverallProgressBar.progress = 0
         downloadProgressPercentageText.text = "0%"
         downloadItemsCountText.text = "0 / $missing"
         downloadErrorDetailsText.text = ""
+        exitButton.bringToFront()
     }
 
     private fun hideDownloadOverlay() {
@@ -833,9 +873,62 @@ class MainActivity : AppCompatActivity() {
         playCurrentItem()
     }
 
+    private fun initializePlayer() {
+        exoPlayer = ExoPlayer.Builder(this).build()
+        playerView.player = exoPlayer
+        exoPlayer?.addListener(object : Player.Listener {
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_READY) {
+                    // Ensure the player surface is visible when frames are ready
+                    hideDownloadOverlay()
+                    pairingView.visibility = View.GONE
+                    playerContainer.visibility = View.VISIBLE
+                    playerContainer.bringToFront()
+                }
+                if (playbackState == Player.STATE_ENDED) {
+                    advanceToNextItem()
+                }
+            }
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (isPlaying) {
+                    hideDownloadOverlay()
+                    pairingView.visibility = View.GONE
+                    playerContainer.visibility = View.VISIBLE
+                    playerContainer.bringToFront()
+                }
+            }
+        })
+    }
+
+    private fun stopVideoPlayback() {
+        exoPlayer?.stop()
+        exoPlayer?.clearMediaItems()
+    }
+
+    private fun applyPlaylistOrientation(orientation: String?) {
+        val normalized = orientation?.trim()?.lowercase()
+        val newOrientation = when (normalized) {
+            "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            "landscape" -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        }
+        if (requestedOrientation != newOrientation) {
+            Log.d(TAG, "Requesting orientation change to: ${normalized ?: "unspecified"}")
+            requestedOrientation = newOrientation
+        }
+    }
+
     private fun showPlayerScreen() {
         pairingView.visibility = View.GONE
         playerContainer.visibility = View.VISIBLE
-        startLockTask()
+        playerContainer.bringToFront()
+        exitButton.bringToFront()
+        // Start kiosk only if permitted to avoid system education dialog overlaying the player
+        try {
+            val dpm = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+            if (dpm.isLockTaskPermitted(packageName)) {
+                startLockTask()
+            }
+        } catch (_: Exception) { /* ignore on non-DO devices */ }
     }
 }

@@ -1,33 +1,45 @@
 <resources>
     <string name="app_name">PixelFlow Player</string>
-    <string name="log_start_enhanced_integration">🚀 PixelFlowPlayer starting with enhanced integration</string>
-    <string name="log_setup_exoplayer">🎛️ Setting up ExoPlayer</string>
-    <string name="log_paired_waiting">📴 CMS reports paired_waiting — clearing local playlist and cache</string>
-    <string name="log_new_playlist_detected">📝 New playlist detected - starting download and playback</string>
-    <string name="log_no_playlist_change">✅ No playlist change or update already in progress; checking player state</string>
-    <string name="log_player_idle">▶️ Playlist unchanged but player idle — starting playback from local/server copy</string>
-    <string name="log_no_local_items">Playlist unchanged and no local items available; staying on paired screen</string>
-    <string name="log_failed_heartbeat_on_reset">Failed to send immediate heartbeat on reset.</string>
-    <string name="log_error_parsing_playlist">Error parsing local playlist from SharedPreferences</string>
-    <string name="log_playlist_unchanged">🟰 Playlist unchanged, skipping download/start</string>
-    <string name="log_no_items_to_download">⚠️ No items to download and play</string>
-    <string name="status_no_items_to_play">No items to play</string>
-    <string name="log_media_cached">✅ All media present in cache — starting playback without download screen</string>
-    <string name="status_downloading_playlist">Downloading playlist…</string>
-    <string name="log_error_playlist_download">❌ Error during playlist download</string>
-    <string name="status_download_failed">Download failed - trying direct playback</string>
-    <string name="log_downloads_complete">🎬 Required downloads complete - starting playback</string>
-    <string name="log_no_items_to_play">⚠️ No items to play</string>
-    <string name="paired_screen_paired">Paired</string>
-    <string name="paired_screen_waiting_for_content">Waiting for content...</string>
-    <string name="loading_screen_loading">Loading...</string>
-    <string name="download_overlay_downloading">Downloading new content…</string>
-    <string name="download_overlay_downloading_item">Downloading new content… (%1$s)</string>
-    <string name="pairing_instructions_unpaired">Go to pixelflow.com/pair and enter the code above</string>
-    <string name="media_playback_attribution_label">Media Playback</string>
-    <string name="pairing_url">Pairing URL</string>
-    <string name="exit_button_description">Exit Button</string>
-    <string name="image_player_description">Image Player</string>
-    <string name="offline_indicator_description">Offline Indicator</string>
 
+    <!-- Logs / diagnostics -->
+    <string name="log_start_enhanced_integration">PixelFlow Player starting</string>
+    <string name="log_setup_exoplayer">Initializing media engine</string>
+    <string name="log_paired_waiting">Device paired; awaiting content. Clearing local cache.</string>
+    <string name="log_new_playlist_detected">New playlist received. Preparing content.</string>
+    <string name="log_no_playlist_change">No playlist changes detected.</string>
+    <string name="log_player_idle">Content unchanged; starting local playback.</string>
+    <string name="log_no_local_items">No local content available. Waiting for content.</string>
+    <string name="log_failed_heartbeat_on_reset">Failed to send heartbeat after reset.</string>
+    <string name="log_error_parsing_playlist">Failed to read saved playlist.</string>
+    <string name="log_playlist_unchanged">Playlist unchanged.</string>
+    <string name="log_no_items_to_download">No media to download.</string>
+    <string name="log_media_cached">All media cached. Starting playback.</string>
+    <string name="log_error_playlist_download">Error while downloading content.</string>
+    <string name="log_downloads_complete">Content ready. Starting playback</string>
+    <string name="log_no_items_to_play">No items to play.</string>
+
+    <!-- User-facing statuses -->
+    <string name="status_no_items_to_play">No media available</string>
+    <string name="status_downloading_playlist">Preparing content…</string>
+    <string name="status_download_failed">Unable to download content. Retrying or streaming if available.</string>
+
+    <!-- Pairing / overlays -->
+    <string name="paired_screen_paired">Device paired</string>
+    <string name="paired_screen_waiting_for_content">Waiting for content assignment…</string>
+    <string name="loading_screen_loading">Starting up…</string>
+    <string name="download_overlay_downloading">Preparing new content…</string>
+    <string name="download_overlay_downloading_item">Preparing new content… (%1$s)</string>
+    <string name="pairing_instructions_unpaired">Open pixelflow.com and enter this code</string>
+    <string name="media_playback_attribution_label">Media Playback</string>
+    <string name="pairing_url">pixelflow.com</string>
+
+    <!-- Accessibility -->
+    <string name="exit_button_description">Close</string>
+    <string name="image_player_description">Image content</string>
+    <string name="offline_indicator_description">Network offline</string>
+
+    <!-- Exit confirmation dialog -->
+    <string name="exit_confirm_message">Do you want to exit the player?</string>
+    <string name="action_yes">Yes</string>
+    <string name="action_no">No</string>
 </resources>
