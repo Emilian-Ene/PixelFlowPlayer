@@ -493,13 +493,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Build a local playlist that rewrites URLs to file:// cached paths, keeping remote URL when not cached
+    // Build a local playlist that rewrites URLs to file:// cached paths, excluding any items not cached
     private fun buildLocalPlaylistFromCache(source: Playlist): Playlist {
-        val mapped = source.items.map { item ->
+        val mapped = source.items.mapNotNull { item ->
             val remoteUrl = if (item.url.startsWith("http") || item.url.startsWith("file://")) item.url else "$BASE_URL${item.url}"
             val file = storageManager.getCacheFile(remoteUrl)
-            val localOrRemote = if (file.exists() && file.length() > 0) "file://${file.absolutePath}" else remoteUrl
-            item.copy(url = localOrRemote)
+            if (file.exists() && file.length() > 0) {
+                item.copy(url = "file://${file.absolutePath}")
+            } else null
         }
         return Playlist(items = mapped, orientation = source.orientation, transitionType = source.transitionType)
     }
@@ -620,16 +621,18 @@ class MainActivity : AppCompatActivity() {
                         updateDownloadOverlay(completedCount, urlsToTrack.size, percent, currentName, errors)
                     }
 
-                    if (failedCount == 0 && completedCount >= urlsToTrack.size) {
-                        Log.d(TAG, "All downloads complete. Releasing player.")
-                        val freshPlaylist = getLocalPlaylist()?.let { buildLocalPlaylistFromCache(it) }
+                    // When all items finished (completed + failed), start playback with cached-only items
+                    if (completedCount + failedCount >= urlsToTrack.size) {
+                        Log.d(TAG, "Downloads finished. Completed=$completedCount, Failed=$failedCount. Starting with cached items only.")
+                        val freshPlaylist = (lastRemotePlaylist ?: getLocalPlaylist())?.let { buildLocalPlaylistFromCache(it) }
                         withContext(Dispatchers.Main) {
                             isBlockingOnDownload = false
                             hideDownloadOverlay()
                             if (freshPlaylist != null && freshPlaylist.items.isNotEmpty()) {
                                 startPlayback(freshPlaylist)
                             } else {
-                                showPairedScreen(instructions = "Failed to load content.")
+                                // Nothing cached → show paired/waiting
+                                showPairedScreen(instructions = getString(R.string.status_no_items_to_play))
                             }
                         }
                         playlistUpdateInProgress = false
@@ -656,8 +659,14 @@ class MainActivity : AppCompatActivity() {
         playerContainer.bringToFront()
 
         val item = currentPlaylistItems[currentItemIndex]
-
         Log.d(TAG, "🎬 Playing item ${currentItemIndex + 1}/${currentPlaylistItems.size}: ${item.url}")
+
+        // Enforce offline-only playback: skip any non-local items
+        if (!item.url.startsWith("file://")) {
+            Log.w(TAG, "Skipping non-local item: ${item.url}")
+            handler.post { advanceToNextItem() }
+            return
+        }
 
         val effectiveDisplayMode = item.displayMode ?: displayMode
 
@@ -665,17 +674,10 @@ class MainActivity : AppCompatActivity() {
         imageAdvanceRunnable?.let { imagePlayerView.removeCallbacks(it) }
         imageAdvanceRunnable = null
 
-        // Resolve to file:// if present, otherwise use absolute HTTP(S) URL (fallback streaming)
-        val uri = when {
-            item.url.startsWith("file://") -> item.url
-            item.url.startsWith("http") -> item.url
-            else -> "$BASE_URL${item.url}"
-        }
+        val uri = item.url
 
         if (item.type.equals("image", true)) {
-            // Single-image playlist: keep it on screen without refreshing
             val durationSec = if (currentPlaylistItems.size == 1) 24 * 60 * 60 else maxOf(1, item.duration)
-
             stopVideoPlayback()
             playerView.visibility = View.GONE
             imagePlayerView.visibility = View.VISIBLE
@@ -694,11 +696,9 @@ class MainActivity : AppCompatActivity() {
             imageAdvanceRunnable = r
             imagePlayerView.postDelayed(r, durationSec * 1000L)
         } else {
-            // Video playback
             imagePlayerView.visibility = View.GONE
             playerView.visibility = View.VISIBLE
             applyVideoScalingAndRotation(effectiveDisplayMode, contentRotation)
-            // Loop if this is the only item
             exoPlayer?.repeatMode = if (currentPlaylistItems.size == 1) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
             exoPlayer?.apply {
                 stop()
