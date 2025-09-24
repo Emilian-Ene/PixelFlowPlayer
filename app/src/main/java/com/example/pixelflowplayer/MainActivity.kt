@@ -125,13 +125,19 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "MainActivity"
         private const val KEY_PENDING_PAIRING_CODE = "pendingPairingCode"
-        private const val BASE_URL = "http://10.0.2.2:3000"
+        private const val BASE_URL = "http://192.168.1.151:3000"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(R.layout.activity_main)
+        
+        // 🔧 Configuration Debug Log
+        Log.i(TAG, "🚀 PixelFlow Player Starting")
+        Log.i(TAG, "🌐 Server URL: $BASE_URL")
+        Log.i(TAG, "📱 Device Model: ${Build.MODEL}")
+        Log.i(TAG, "🤖 Android Version: ${Build.VERSION.RELEASE}")
 
         Log.d(TAG, getString(R.string.log_start_enhanced_integration))
 
@@ -319,12 +325,35 @@ class MainActivity : AppCompatActivity() {
                     if (response.isSuccessful) {
                         val heartbeatResponse = response.body()
                         val wasPaired = getSharedPreferences("PixelFlowPlayerPrefs", MODE_PRIVATE).getBoolean("isPaired", false)
-                        Log.d(TAG, "Heartbeat Success. Response: ${heartbeatResponse?.status}. Paired: $wasPaired")
+                        Log.d(TAG, "🔄 Heartbeat Success. Status: ${heartbeatResponse?.status}. Paired: $wasPaired")
+                        Log.d(TAG, "🔄 Playlist items count: ${heartbeatResponse?.playlist?.items?.size ?: 0}")
+                        heartbeatResponse?.playlist?.items?.forEach { item ->
+                            Log.d(TAG, "🔄 Item: ${item.type} - ${item.url} (${item.duration}s)")
+                        }
 
                         if (wasPaired && heartbeatResponse?.status == "unpaired") {
                             handleUnpairingAndReset(); return@launch
                         }
                         when (heartbeatResponse?.status) {
+                            "unpaired" -> {
+                                // Ensure we have a pairing code and show pairing UI
+                                if (pairingCodeForHeartbeat.isBlank()) {
+                                    pairingCodeForHeartbeat = getOrCreatePendingPairingCode()
+                                }
+                                getSharedPreferences("PixelFlowPlayerPrefs", MODE_PRIVATE).edit {
+                                    putBoolean("isPaired", false)
+                                }
+                                withContext(Dispatchers.Main) {
+                                    // Stop any playback/overlays and show the pairing code screen
+                                    downloadProgressJob?.cancel(); downloadProgressJob = null
+                                    isBlockingOnDownload = false
+                                    stopVideoPlayback()
+                                    hideDownloadOverlay()
+                                    currentPlaylistItems = emptyList()
+                                    currentItemIndex = 0
+                                    showPairedScreen(pairingCodeForHeartbeat, getString(R.string.pairing_instructions_unpaired))
+                                }
+                            }
                             "paired_waiting" -> {
                                 if (!wasPaired) {
                                     getSharedPreferences("PixelFlowPlayerPrefs", MODE_PRIVATE).edit {
@@ -493,13 +522,21 @@ class MainActivity : AppCompatActivity() {
 
     // Build a local playlist that rewrites URLs to file:// cached paths, excluding any items not cached
     private fun buildLocalPlaylistFromCache(source: Playlist): Playlist {
+        Log.d(TAG, "🔍 Building local playlist from cache. Source has ${source.items.size} items")
         val mapped = source.items.mapNotNull { item ->
             val remoteUrl = if (item.url.startsWith("http") || item.url.startsWith("file://")) item.url else "$BASE_URL${item.url}"
             val file = storageManager.getCacheFile(remoteUrl)
+            Log.d(TAG, "🔍 Checking item: ${item.url} -> $remoteUrl")
+            Log.d(TAG, "🔍 Cache file: ${file.absolutePath} (exists: ${file.exists()}, size: ${if (file.exists()) file.length() else 0})")
             if (file.exists() && file.length() > 0) {
+                Log.d(TAG, "✅ Found cached file for: $remoteUrl")
                 item.copy(url = "file://${file.absolutePath}")
-            } else null
+            } else {
+                Log.w(TAG, "❌ No cached file for: $remoteUrl")
+                null
+            }
         }
+        Log.d(TAG, "🔍 Built local playlist with ${mapped.size} cached items")
         return Playlist(items = mapped, orientation = source.orientation, transitionType = source.transitionType)
     }
 
@@ -534,8 +571,23 @@ class MainActivity : AppCompatActivity() {
                 !f.exists() || f.length() == 0L
             }.toSet()
 
+            // If nothing is missing, do not show the blocking download UI. Just rebuild and play.
+            if (missingUrls.isEmpty()) {
+                Log.d(TAG, "No downloads needed; applying metadata changes and starting playback immediately.")
+                storageManager.cleanupCacheExcept(allTargetUrls)
+                val localPl = buildLocalPlaylistFromCache(newPlaylist)
+                withContext(Dispatchers.Main) {
+                    isBlockingOnDownload = false
+                    downloadProgressJob?.cancel(); downloadProgressJob = null
+                    saveLocalPlaylist(newPlaylist)
+                    if (localPl.items.isNotEmpty()) startPlayback(localPl) else showPairedScreen(instructions = getString(R.string.status_no_items_to_play))
+                    playlistUpdateInProgress = false
+                }
+                return@launch
+            }
+
             withContext(Dispatchers.Main) {
-                // Always show blocking download splash until 100% ready
+                // Show blocking overlay only when we really need to download files
                 isBlockingOnDownload = true
                 stopVideoPlayback()
                 playerContainer.visibility = View.GONE
@@ -544,7 +596,6 @@ class MainActivity : AppCompatActivity() {
                 saveLocalPlaylist(newPlaylist)
                 playbackStartedFromDownloads = false
                 downloadProgressJob?.cancel()
-                // Track ALL items; cached ones will be counted as completed
                 monitorDownloadProgress(allTargetUrls)
 
                 // Launch downloads only for the missing ones
@@ -622,7 +673,10 @@ class MainActivity : AppCompatActivity() {
                     // When all items finished (completed + failed), start playback with cached-only items
                     if (completedCount + failedCount >= urlsToTrack.size) {
                         Log.d(TAG, "Downloads finished. Completed=$completedCount, Failed=$failedCount. Starting with cached items only.")
+                        // Give the filesystem a moment to flush writes before we scan cache
+                        delay(350)
                         val freshPlaylist = (lastRemotePlaylist ?: getLocalPlaylist())?.let { buildLocalPlaylistFromCache(it) }
+                        Log.d(TAG, "🔍 freshPlaylist items after cache scan: ${freshPlaylist?.items?.size ?: 0}")
                         withContext(Dispatchers.Main) {
                             isBlockingOnDownload = false
                             hideDownloadOverlay()
@@ -641,97 +695,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 🎬 Play the current playlist item (PlayerManager controls advancing)
-     */
-    private fun playCurrentItem() {
-        if (currentPlaylistItems.isEmpty()) {
-            Log.w(TAG, getString(R.string.log_no_items_to_play))
-            statusText.text = getString(R.string.status_no_items_to_play)
-            showPairedScreen()
-            return
-        }
-        handler.removeCallbacksAndMessages(null)
-        loadingBar.visibility = View.GONE
-        if (!isBlockingOnDownload) hideDownloadOverlay()
-        playerContainer.visibility = View.VISIBLE
-        playerContainer.bringToFront()
-
-        val item = currentPlaylistItems[currentItemIndex]
-        Log.d(TAG, "🎬 Playing item ${currentItemIndex + 1}/${currentPlaylistItems.size}: ${item.url}")
-
-        // Enforce offline-only playback: skip any non-local items
-        if (!item.url.startsWith("file://")) {
-            Log.w(TAG, "Skipping non-local item: ${item.url}")
-            handler.post { advanceToNextItem() }
-            return
-        }
-
-        val effectiveDisplayMode = item.displayMode ?: displayMode
-
-        // Cancel any pending image advance
-        imageAdvanceRunnable?.let { imagePlayerView.removeCallbacks(it) }
-        imageAdvanceRunnable = null
-
-        val uri = item.url
-
-        if (item.type.equals("image", true)) {
-            val durationSec = if (currentPlaylistItems.size == 1) 24 * 60 * 60 else maxOf(1, item.duration)
-            stopVideoPlayback()
-            playerView.visibility = View.GONE
-            imagePlayerView.visibility = View.VISIBLE
-            imagePlayerView.rotation = contentRotation.toFloat()
-            imagePlayerView.scaleType = when (effectiveDisplayMode?.lowercase()) {
-                "cover" -> ImageView.ScaleType.CENTER_CROP
-                "fill" -> ImageView.ScaleType.FIT_XY
-                else -> ImageView.ScaleType.FIT_CENTER
-            }
-            Glide.with(this)
-                .load(uri)
-                .skipMemoryCache(true)
-                .into(imagePlayerView)
-
-            val r = Runnable { advanceToNextItem() }
-            imageAdvanceRunnable = r
-            imagePlayerView.postDelayed(r, durationSec * 1000L)
-        } else {
-            imagePlayerView.visibility = View.GONE
-            playerView.visibility = View.VISIBLE
-            applyVideoScalingAndRotation(effectiveDisplayMode, contentRotation)
-            exoPlayer?.repeatMode = if (currentPlaylistItems.size == 1) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
-            exoPlayer?.apply {
-                stop()
-                setMediaItem(MediaItem.fromUri(uri))
-                prepare()
-                play()
-            }
-        }
-    }
-
-    private fun applyVideoScalingAndRotation(mode: String?, rotation: Int) {
-        val resizeMode = when (mode?.lowercase()) {
-            "contain" -> AspectRatioFrameLayout.RESIZE_MODE_FIT
-            "cover" -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-            "fill" -> AspectRatioFrameLayout.RESIZE_MODE_FILL
-            else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
-        }
-        playerView.resizeMode = resizeMode
-        playerView.rotation = rotation.toFloat()
-    }
-
-    private fun applyContentRotation(rotationDegrees: Int) {
-        val norm = ((rotationDegrees % 360) + 360) % 360
-        if (contentRotation == norm) return
-        Log.d(TAG, "Applying content rotation=${norm}° to media views")
-        contentRotation = norm
-        if (currentPlaylistItems.isNotEmpty()) {
-            playCurrentItem()
-        }
-    }
-
-    /**
      * Start playback for the given playlist using direct ExoPlayer/Glide pipeline
      */
     private fun startPlayback(playlist: Playlist) {
+        Log.d(TAG, "🎬 startPlayback() with ${playlist.items.size} items")
         runOnUiThread {
             applyPlaylistOrientation(playlist.orientation)
             if (!isBlockingOnDownload) hideDownloadOverlay()
@@ -875,6 +842,79 @@ class MainActivity : AppCompatActivity() {
         playCurrentItem()
     }
 
+    // Play the current item (image or video) from the cached file:// URL
+    private fun playCurrentItem() {
+        if (currentPlaylistItems.isEmpty()) {
+            Log.w(TAG, getString(R.string.log_no_items_to_play))
+            statusText.text = getString(R.string.status_no_items_to_play)
+            showPairedScreen()
+            return
+        }
+
+        // Ensure UI state
+        handler.removeCallbacksAndMessages(null)
+        loadingBar.visibility = View.GONE
+        if (!isBlockingOnDownload) hideDownloadOverlay()
+        pairingView.visibility = View.GONE
+        playerContainer.visibility = View.VISIBLE
+        playerContainer.bringToFront()
+
+        val item = currentPlaylistItems[currentItemIndex]
+        Log.d(TAG, "🎬 Playing item ${currentItemIndex + 1}/${currentPlaylistItems.size}: ${item.url}")
+
+        // Only play local cached items
+        if (!item.url.startsWith("file://")) {
+            Log.w(TAG, "Skipping non-local item: ${item.url}")
+            handler.post { advanceToNextItem() }
+            return
+        }
+
+        // Apply display mode for images
+        fun applyImageDisplayMode(mode: String?) {
+            when ((mode ?: "contain").lowercase()) {
+                "cover" -> imagePlayerView.scaleType = ImageView.ScaleType.CENTER_CROP
+                "fill" -> imagePlayerView.scaleType = ImageView.ScaleType.FIT_XY
+                else -> imagePlayerView.scaleType = ImageView.ScaleType.FIT_CENTER
+            }
+        }
+
+        // Stop any pending image advance
+        imageAdvanceRunnable?.let { handler.removeCallbacks(it) }
+        imageAdvanceRunnable = null
+
+        if (item.type.equals("video", ignoreCase = true)) {
+            // Video via ExoPlayer
+            imagePlayerView.visibility = View.GONE
+            playerView.visibility = View.VISIBLE
+            try {
+                exoPlayer?.stop()
+                exoPlayer?.clearMediaItems()
+                val mediaItem = MediaItem.fromUri(item.url)
+                exoPlayer?.setMediaItem(mediaItem)
+                exoPlayer?.prepare()
+                exoPlayer?.playWhenReady = true
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start video playback", e)
+                handler.post { advanceToNextItem() }
+            }
+        } else {
+            // Image via Glide
+            playerView.visibility = View.GONE
+            imagePlayerView.visibility = View.VISIBLE
+            applyImageDisplayMode(item.displayMode)
+            try {
+                Glide.with(this).load(item.url).into(imagePlayerView)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load image", e)
+                handler.post { advanceToNextItem() }
+                return
+            }
+            val seconds = if (item.duration > 0) item.duration else 8
+            imageAdvanceRunnable = Runnable { advanceToNextItem() }
+            handler.postDelayed(imageAdvanceRunnable!!, seconds * 1000L)
+        }
+    }
+
     private fun initializePlayer() {
         exoPlayer = ExoPlayer.Builder(this).build()
         playerView.player = exoPlayer
@@ -918,6 +958,15 @@ class MainActivity : AppCompatActivity() {
             Log.d(TAG, "Requesting orientation change to: ${normalized ?: "unspecified"}")
             requestedOrientation = newOrientation
         }
+    }
+
+    // NEW: apply content rotation coming from backend (0/90/180/270)
+    private fun applyContentRotation(rotationDegrees: Int) {
+        val rot = ((rotationDegrees % 360) + 360) % 360 // normalize
+        Log.d(TAG, "Applying content rotation: $rot°")
+        // Rotate both the image and video containers
+        imagePlayerView.rotation = rot.toFloat()
+        playerView.rotation = rot.toFloat()
     }
 
     private fun showPlayerScreen() {

@@ -48,8 +48,8 @@ object ApiClient {
     //
     // 💡 TO SWITCH: Change HOST_IP below based on your testing method
     
-    private const val HOST_IP = "10.0.2.2"        // 🤖 FOR EMULATOR
-    // private const val HOST_IP = "192.168.1.151" // 📱 FOR PHYSICAL DEVICE (uncomment this line and comment above)
+    // private const val HOST_IP = "10.0.2.2"        // 🤖 FOR EMULATOR
+    private const val HOST_IP = "192.168.1.151" // 📱 FOR PHYSICAL DEVICE (uncomment this line and comment above)
     
     private const val PORT = "3000"
     private const val BASE_URL = "http://$HOST_IP:$PORT/api/"
