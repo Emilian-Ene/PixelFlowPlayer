@@ -8,6 +8,7 @@ data class Playlist(
     /**
      * Compares this playlist to another, checking essential content and presentation properties.
      * - Ignores local vs remote URL prefixes by comparing only the filename.
+     * - Strips optional cache hash prefixes like "<md5>_" from local file names before compare.
      * - Compares orientation and transitionType.
      * - Compares each item's type, url filename, duration, displayMode, and optional dimensions.
      */
@@ -18,12 +19,21 @@ data class Playlist(
         if (this.transitionType != other.transitionType) return false
         if (this.items.size != other.items.size) return false
 
+        fun normalize(name: String): String {
+            val base = name.substringAfterLast('/')
+            // Remove "file://" path and Windows-style path separators defensively
+            val clean = base.substringAfterLast('\\')
+            // Strip md5/hash prefix if present (32 hex chars + underscore)
+            val regex = Regex("^[0-9a-fA-F]{32}_")
+            return clean.replace(regex, "")
+        }
+
         for (i in this.items.indices) {
             val a = this.items[i]
             val b = other.items[i]
 
-            val aName = a.url.substringAfterLast('/')
-            val bName = b.url.substringAfterLast('/')
+            val aName = normalize(a.url)
+            val bName = normalize(b.url)
 
             val aMode = a.displayMode ?: "contain"
             val bMode = b.displayMode ?: "contain"

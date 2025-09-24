@@ -1,27 +1,33 @@
-<?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">pixelflow.player</string>
+    <string name="app_name">PixelFlow Player</string>
+    <string name="log_start_enhanced_integration">🚀 PixelFlowPlayer starting with enhanced integration</string>
+    <string name="log_setup_exoplayer">🎛️ Setting up ExoPlayer</string>
+    <string name="log_paired_waiting">📴 CMS reports paired_waiting — clearing local playlist and cache</string>
+    <string name="log_new_playlist_detected">📝 New playlist detected - starting download and playback</string>
+    <string name="log_no_playlist_change">✅ No playlist change or update already in progress; checking player state</string>
+    <string name="log_player_idle">▶️ Playlist unchanged but player idle — starting playback from local/server copy</string>
+    <string name="log_no_local_items">Playlist unchanged and no local items available; staying on paired screen</string>
+    <string name="log_failed_heartbeat_on_reset">Failed to send immediate heartbeat on reset.</string>
+    <string name="log_error_parsing_playlist">Error parsing local playlist from SharedPreferences</string>
+    <string name="log_playlist_unchanged">🟰 Playlist unchanged, skipping download/start</string>
+    <string name="log_no_items_to_download">⚠️ No items to download and play</string>
+    <string name="status_no_items_to_play">No items to play</string>
+    <string name="log_media_cached">✅ All media present in cache — starting playback without download screen</string>
+    <string name="status_downloading_playlist">Downloading playlist…</string>
+    <string name="log_error_playlist_download">❌ Error during playlist download</string>
+    <string name="status_download_failed">Download failed - trying direct playback</string>
+    <string name="log_downloads_complete">🎬 Required downloads complete - starting playback</string>
+    <string name="log_no_items_to_play">⚠️ No items to play</string>
+    <string name="paired_screen_paired">Paired</string>
+    <string name="paired_screen_waiting_for_content">Waiting for content...</string>
+    <string name="loading_screen_loading">Loading...</string>
+    <string name="download_overlay_downloading">Downloading new content…</string>
+    <string name="download_overlay_downloading_item">Downloading new content… (%1$s)</string>
+    <string name="pairing_instructions_unpaired">Go to pixelflow.com/pair and enter the code above</string>
     <string name="media_playback_attribution_label">Media Playback</string>
-    <string name="pairing_url">pixelflow.com</string>
-    <string name="pairing_instructions_unpaired">to pair the device and start using it</string>
-    <string name="paired_title">Paired</string>
-    <string name="pairing_instructions_paired">to assign content</string>
-    <string name="exit_dialog_title">Do you want to exit pixelflow.player?</string>
-    <string name="exit_dialog_exit_button">Exit</string>
-    <string name="exit_dialog_cancel_button">Cancel</string>
-    <string name="exit_button_description">Exit Application</string>
-    <string name="image_player_description">Displayed image content</string>
-    <string name="offline_indicator_description">Offline indicator icon</string>
-
-        <!-- ... your existing strings ... -->
-
-        <!-- Download Progress Strings -->
-        <string name="download_preparing">Preparing to download…</string>
-        <string name="download_in_progress">Downloading playlist…</string>
-        <string name="download_item_progress">Item %1$d of %2$d: %3$s</string> <!-- For "Item 1 of 5: video.mp4" -->
-        <string name="download_errors_encountered">Download errors encountered</string>
-        <string name="download_complete">Playlist download complete!</string>
-        <string name="download_failed_critical">Critical Download Failure</string>
-        <string name="pairing_instructions_unpaired_after_fail">Pairing code. Download failed, please check connection or content and retry pairing.</string>
+    <string name="pairing_url">Pairing URL</string>
+    <string name="exit_button_description">Exit Button</string>
+    <string name="image_player_description">Image Player</string>
+    <string name="offline_indicator_description">Offline Indicator</string>
 
 </resources>

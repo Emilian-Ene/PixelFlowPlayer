@@ -51,7 +51,7 @@
         android:layout_height="wrap_content"
         android:layout_gravity="center"
         android:indeterminateTint="@android:color/white"
-        android:visibility="visible"
+        android:visibility="gone"
         tools:visibility="visible" />
 
     <!-- Exit Button -->
@@ -79,12 +79,16 @@
             android:id="@+id/video_player_view"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
+            android:background="@android:color/black"
             app:use_controller="false"
-            app:resize_mode="zoom"/>
+            app:resize_mode="zoom"
+            app:surface_type="texture_view"
+            app:shutter_background_color="@android:color/black" />
         <ImageView
             android:id="@+id/image_player_view"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
+            android:background="@android:color/black"
             android:scaleType="centerCrop"
             android:contentDescription="@string/image_player_description" />
     </FrameLayout>
@@ -109,7 +113,7 @@
         android:layout_gravity="center"
         android:layout_marginStart="32dp"
         android:layout_marginEnd="32dp"
-        android:background="#A0000000"
+        android:background="@android:color/black"
         android:orientation="vertical"
         android:padding="24dp"
         android:visibility="gone"
