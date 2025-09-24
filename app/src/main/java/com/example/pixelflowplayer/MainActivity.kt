@@ -2,6 +2,7 @@ package com.example.pixelflowplayer
 
 import android.annotation.SuppressLint
 import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Build
@@ -149,6 +150,18 @@ class MainActivity : AppCompatActivity() {
         // Start with splash screen flow (restored from old file)
         startSplashScreenFlow()
         startPeriodicNetworkCheck()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        Log.d(TAG, "Configuration changed, forcing a re-layout and re-render.")
+        // Post to handler to ensure it runs after the configuration change is fully processed
+        handler.post {
+            playerContainer.requestLayout() // Explicitly request a re-measure and re-layout
+            if (currentPlaylistItems.isNotEmpty()) {
+                playCurrentItem()
+            }
+        }
     }
 
     private fun findViews() {
@@ -652,7 +665,10 @@ class MainActivity : AppCompatActivity() {
                 "fill" -> ImageView.ScaleType.FIT_XY
                 else -> ImageView.ScaleType.FIT_CENTER
             }
-            Glide.with(this).load(uri).into(imagePlayerView)
+            Glide.with(this)
+                .load(uri)
+                .skipMemoryCache(true) // Force reload from disk to adapt to new view size
+                .into(imagePlayerView)
 
             val r = Runnable { advanceToNextItem() }
             imageAdvanceRunnable = r
@@ -686,9 +702,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyContentRotation(rotationDegrees: Int) {
         val norm = ((rotationDegrees % 360) + 360) % 360
+        if (contentRotation == norm) return
         Log.d(TAG, "Applying content rotation=${norm}° to media views")
         contentRotation = norm
-        // The actual rotation will be applied in PlayerManager
+        if (currentPlaylistItems.isNotEmpty()) {
+            playCurrentItem()
+        }
     }
 
     /**
@@ -758,10 +777,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun applyPlaylistOrientation(orientation: String?) {
-        requestedOrientation = when (orientation) {
+        val normalized = orientation?.trim()?.lowercase() // CMS may send 'Landscape'/'Portrait'
+        val newOrientation = when (normalized) {
             "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
             "landscape" -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
             else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        }
+        if (requestedOrientation != newOrientation) {
+            Log.d(TAG, "Requesting orientation change to: ${normalized ?: "unspecified"}")
+            requestedOrientation = newOrientation
         }
     }
 
