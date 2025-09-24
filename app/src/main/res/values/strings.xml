@@ -13,7 +13,7 @@
     <string name="log_error_parsing_playlist">Failed to read saved playlist.</string>
     <string name="log_playlist_unchanged">Playlist unchanged.</string>
     <string name="log_no_items_to_download">No media to download.</string>
-    <string name="log_media_cached">All media cached. Starting playback.</string>
+    <string name="log_media_cached">All media cached. Starting the player.</string>
     <string name="log_error_playlist_download">Error while downloading content.</string>
     <string name="log_downloads_complete">Content ready. Starting playback</string>
     <string name="log_no_items_to_play">No items to play.</string>
