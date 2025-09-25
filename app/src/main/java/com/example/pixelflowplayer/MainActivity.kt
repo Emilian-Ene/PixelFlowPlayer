@@ -1,17 +1,25 @@
 package com.example.pixelflowplayer
 
+import android.app.ActivityManager
 import android.app.AlertDialog
 import android.app.admin.DevicePolicyManager
 import android.content.Context
 import android.annotation.SuppressLint
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
+import android.os.PowerManager
 import android.os.Looper
+import android.os.StatFs
+import android.os.SystemClock
 import android.util.Log
 import android.view.KeyEvent
 import android.view.View
@@ -29,6 +37,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.isVisible
 import androidx.lifecycle.lifecycleScope
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
@@ -46,8 +55,16 @@ import com.example.pixelflowplayer.player.DeviceInfo
 import com.example.pixelflowplayer.player.HeartbeatRequest
 import com.example.pixelflowplayer.player.Playlist
 import com.example.pixelflowplayer.player.PlaylistItem
+import com.example.pixelflowplayer.player.DisplayInfo
+import com.example.pixelflowplayer.player.DisplayModeInfo
+import com.example.pixelflowplayer.player.VideoCodecSupport
+import com.example.pixelflowplayer.player.StorageInfo
+import com.example.pixelflowplayer.player.MemoryInfoDto
+import com.example.pixelflowplayer.player.BatteryInfo
+import com.example.pixelflowplayer.player.NetworkInfoDto
+import com.example.pixelflowplayer.player.LocaleTimeInfo
+import com.example.pixelflowplayer.player.PlayerStats
 import com.example.pixelflowplayer.storage.StorageManager
-import com.google.gson.Gson
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -55,7 +72,16 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.security.MessageDigest
+import java.util.Locale
+import java.util.TimeZone
 import java.util.UUID
+import com.google.gson.Gson
+import android.view.Surface
+import android.hardware.display.DisplayManager
+import android.view.Display
+import android.media.MediaCodecList
 
 @OptIn(UnstableApi::class)
 class MainActivity : AppCompatActivity() {
@@ -314,11 +340,19 @@ class MainActivity : AppCompatActivity() {
                     delay(15000); continue
                 }
                 try {
-                    // Create device info for heartbeat
+                    // Create device info for heartbeat with display/codec support
                     val deviceInfo = DeviceInfo(
-                        model = Build.MODEL,
-                        androidVersion = Build.VERSION.RELEASE,
-                        appVersion = "1.0.0" // You can get this from BuildConfig if needed
+                        model = "${Build.MANUFACTURER} ${Build.MODEL}",
+                        androidVersion = Build.VERSION.RELEASE ?: Build.VERSION.SDK_INT.toString(),
+                        appVersion = getAppVersion(),
+                        display = collectDisplayInfo(),
+                        videoSupport = collectVideoSupport(),
+                        storage = collectStorageInfo(),
+                        memory = collectMemoryInfo(),
+                        battery = collectBatteryInfo(),
+                        network = collectNetworkInfo(),
+                        localeTime = collectLocaleTimeInfo(),
+                        playerStats = collectPlayerStats()
                     )
                     val request = HeartbeatRequest(deviceId, pairingCodeForHeartbeat, deviceInfo)
                     val response = ApiClient.apiService.deviceHeartbeat(request)
@@ -400,7 +434,14 @@ class MainActivity : AppCompatActivity() {
                                 val newPlaylistFromServer = heartbeatResponse.playlist
 
                                 // Ensure the paired screen is hidden as soon as content is assigned
-                                withContext(Dispatchers.Main) { pairingView.visibility = View.GONE }
+                                withContext(Dispatchers.Main) {
+                                    // Always force player visible on PLAYING
+                                    pairingView.visibility = View.GONE
+                                    isBlockingOnDownload = false
+                                    hideDownloadOverlay()
+                                    playerContainer.visibility = View.VISIBLE
+                                    playerContainer.bringToFront()
+                                }
 
                                 if (newPlaylistFromServer != null) {
                                     withContext(Dispatchers.Main) { applyPlaylistOrientation(newPlaylistFromServer.orientation) }
@@ -490,9 +531,17 @@ class MainActivity : AppCompatActivity() {
             }
             try {
                 val deviceInfo = DeviceInfo(
-                    model = Build.MODEL,
-                    androidVersion = Build.VERSION.RELEASE,
-                    appVersion = "1.0.0"
+                    model = "${Build.MANUFACTURER} ${Build.MODEL}",
+                    androidVersion = Build.VERSION.RELEASE ?: Build.VERSION.SDK_INT.toString(),
+                    appVersion = getAppVersion(),
+                    display = collectDisplayInfo(),
+                    videoSupport = collectVideoSupport(),
+                    storage = collectStorageInfo(),
+                    memory = collectMemoryInfo(),
+                    battery = collectBatteryInfo(),
+                    network = collectNetworkInfo(),
+                    localeTime = collectLocaleTimeInfo(),
+                    playerStats = collectPlayerStats()
                 )
                 ApiClient.apiService.deviceHeartbeat(HeartbeatRequest(deviceId, newPairingCode, deviceInfo))
             } catch (e: Exception) {
@@ -700,8 +749,13 @@ class MainActivity : AppCompatActivity() {
     private fun startPlayback(playlist: Playlist) {
         Log.d(TAG, "🎬 startPlayback() with ${playlist.items.size} items")
         runOnUiThread {
+            // Belt-and-suspenders: whenever playback starts, ensure overlay is gone and player is visible
+            pairingView.visibility = View.GONE
+            isBlockingOnDownload = false
+            hideDownloadOverlay()
+            playerContainer.visibility = View.VISIBLE
+            playerContainer.bringToFront()
             applyPlaylistOrientation(playlist.orientation)
-            if (!isBlockingOnDownload) hideDownloadOverlay()
             if (playerContainer.visibility != View.VISIBLE) showPlayerScreen()
 
             currentPlaylistItems = playlist.items
@@ -878,6 +932,31 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // Apply display mode for videos
+        fun applyVideoDisplayMode(mode: String?) {
+            when ((mode ?: "contain").lowercase()) {
+                // Contain: fit inside without cropping
+                "contain" -> {
+                    playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    exoPlayer?.setVideoScalingMode(C.VIDEO_SCALING_MODE_DEFAULT)
+                }
+                // Cover: fill and crop overflow
+                "cover" -> {
+                    playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                    exoPlayer?.setVideoScalingMode(C.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING)
+                }
+                // Fill: stretch to view bounds (may distort)
+                "fill" -> {
+                    playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FILL
+                    exoPlayer?.setVideoScalingMode(C.VIDEO_SCALING_MODE_DEFAULT)
+                }
+                else -> {
+                    playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    exoPlayer?.setVideoScalingMode(C.VIDEO_SCALING_MODE_DEFAULT)
+                }
+            }
+        }
+
         // Stop any pending image advance
         imageAdvanceRunnable?.let { handler.removeCallbacks(it) }
         imageAdvanceRunnable = null
@@ -886,6 +965,8 @@ class MainActivity : AppCompatActivity() {
             // Video via ExoPlayer
             imagePlayerView.visibility = View.GONE
             playerView.visibility = View.VISIBLE
+            // NEW: apply media fit for videos
+            applyVideoDisplayMode(item.displayMode)
             try {
                 exoPlayer?.stop()
                 exoPlayer?.clearMediaItems()
@@ -981,5 +1062,177 @@ class MainActivity : AppCompatActivity() {
                 startLockTask()
             }
         } catch (_: Exception) { /* ignore on non-DO devices */ }
+    }
+
+    // Helper: app version without BuildConfig dependency
+    private fun getAppVersion(): String {
+        return try {
+            val p = packageManager.getPackageInfo(packageName, 0)
+            // Prefer versionName; fall back to longVersionCode
+            @Suppress("DEPRECATION")
+            p.versionName ?: (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) p.longVersionCode.toString() else "1.0.0")
+        } catch (_: Exception) {
+            "1.0.0"
+        }
+    }
+
+    private fun collectStorageInfo(): StorageInfo? {
+        return try {
+            val dir = filesDir
+            val stat = StatFs(dir.absolutePath)
+            val total = stat.totalBytes
+            val free = stat.availableBytes
+            val cacheDir = File(filesDir, "media_cache")
+            val cache = computeDirSize(cacheDir)
+            StorageInfo(totalBytes = total, freeBytes = free, appCacheBytes = cache)
+        } catch (_: Exception) { null }
+    }
+
+    private fun computeDirSize(file: File?): Long {
+        if (file == null || !file.exists()) return 0
+        if (file.isFile) return file.length()
+        return file.listFiles()?.sumOf { computeDirSize(it) } ?: 0
+    }
+
+    private fun collectMemoryInfo(): MemoryInfoDto? {
+        return try {
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val mi = ActivityManager.MemoryInfo()
+            am.getMemoryInfo(mi)
+            MemoryInfoDto(totalRamBytes = mi.totalMem, availRamBytes = mi.availMem, lowMemory = mi.lowMemory)
+        } catch (_: Exception) { null }
+    }
+
+    private fun collectBatteryInfo(): BatteryInfo? {
+        return try {
+            val intent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+            val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+            val pct = if (level >= 0 && scale > 0) ((level * 100f / scale).toInt()) else null
+            val status = intent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+            val charging = status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            BatteryInfo(levelPercent = pct, charging = charging, powerSave = pm.isPowerSaveMode)
+        } catch (_: Exception) { null }
+    }
+
+    private fun collectNetworkInfo(): NetworkInfoDto? {
+        return try {
+            val cm = connectivityManager
+            val active = cm.activeNetwork
+            val caps = cm.getNetworkCapabilities(active)
+            val online = caps != null
+            val transports = mutableListOf<String>()
+            if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) transports.add("WiFi")
+            if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true) transports.add("Cellular")
+            if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true) transports.add("Ethernet")
+            if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) transports.add("VPN")
+            val metered = try { cm.isActiveNetworkMetered } catch (_: Exception) { null }
+            val validated = try { caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) } catch (_: Exception) { null }
+            val vpnActive = caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+            NetworkInfoDto(online, transports, metered, validated, vpnActive)
+        } catch (_: Exception) { null }
+    }
+
+    private fun collectLocaleTimeInfo(): LocaleTimeInfo? {
+        return try {
+            val tz = TimeZone.getDefault().id
+            val lc = Locale.getDefault().toLanguageTag()
+            val is24 = android.text.format.DateFormat.is24HourFormat(this)
+            val uptime = SystemClock.uptimeMillis()
+            LocaleTimeInfo(timezone = tz, locale = lc, is24h = is24, uptimeMs = uptime)
+        } catch (_: Exception) { null }
+    }
+
+    private fun md5(input: String): String {
+        return try {
+            val md = MessageDigest.getInstance("MD5")
+            val bytes = md.digest(input.toByteArray())
+            bytes.joinToString("") { "%02x".format(it) }
+        } catch (_: Exception) { "" }
+    }
+
+    private fun collectPlayerStats(): PlayerStats? {
+        return try {
+            val pl = lastRemotePlaylist
+            val urls = pl?.items?.joinToString("|") { it.url }
+            val hash = urls?.let { md5(it) }
+            val idx = currentItemIndex
+            val current = currentPlaylistItems.getOrNull(idx)
+            val decoder = try { exoPlayer?.videoFormat?.codecs } catch (_: Exception) { null }
+            PlayerStats(
+                playlistHash = hash,
+                itemCount = currentPlaylistItems.size,
+                currentIndex = if (idx >= 0) idx else 0,
+                currentUrl = current?.url,
+                currentType = current?.type,
+                decoderName = decoder,
+                droppedFrames = null, // optional, can be wired with analytics later
+                lastDownloadErrors = null
+            )
+        } catch (_: Exception) { null }
+    }
+
+    // Helper: collect current display metrics and supported modes
+    private fun collectDisplayInfo(): DisplayInfo? {
+        return try {
+            val dm = resources.displayMetrics
+            val disp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) display else @Suppress("DEPRECATION") windowManager.defaultDisplay
+            val refresh = try { disp?.refreshRate ?: 60f } catch (_: Exception) { 60f }
+            val rotationDegrees = when (try { disp?.rotation } catch (_: Exception) { Surface.ROTATION_0 }) {
+                Surface.ROTATION_90 -> 90
+                Surface.ROTATION_180 -> 180
+                Surface.ROTATION_270 -> 270
+                else -> 0
+            }
+            val supported = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val mgr = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+                val d = mgr.getDisplay(Display.DEFAULT_DISPLAY)
+                d?.supportedModes?.map { mode: Display.Mode ->
+                    DisplayModeInfo(
+                        widthPx = mode.physicalWidth,
+                        heightPx = mode.physicalHeight,
+                        refreshRate = try { mode.refreshRate } catch (_: Exception) { d.refreshRate }
+                    )
+                }
+            } else null
+            DisplayInfo(
+                currentWidthPx = dm.widthPixels,
+                currentHeightPx = dm.heightPixels,
+                densityDpi = dm.densityDpi,
+                refreshRate = refresh,
+                rotation = rotationDegrees,
+                supportedModes = supported
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    // Helper: collect approximate decoder max resolution for common codecs
+    private fun collectVideoSupport(): List<VideoCodecSupport>? {
+        return try {
+            val wanted = listOf("video/avc", "video/hevc")
+            val results = mutableMapOf<String, Pair<Int, Int>>()
+            val list = if (Build.VERSION.SDK_INT >= 21) MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos else @Suppress("DEPRECATION") MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
+            for (info in list) {
+                if (info.isEncoder) continue
+                for (type in info.supportedTypes) {
+                    if (type.lowercase() in wanted) {
+                        try {
+                            val caps = info.getCapabilitiesForType(type)
+                            val v = caps.videoCapabilities
+                            val w = v.supportedWidths.upper
+                            val h = v.supportedHeights.upper
+                            val prev = results[type.lowercase()]
+                            if (prev == null || (w * h) > (prev.first * prev.second)) {
+                                results[type.lowercase()] = w to h
+                            }
+                        } catch (_: Exception) { /* ignore codec */ }
+                    }
+                }
+            }
+            results.map { (codec, wh) -> VideoCodecSupport(codec, wh.first, wh.second) }
+        } catch (_: Exception) { null }
     }
 }

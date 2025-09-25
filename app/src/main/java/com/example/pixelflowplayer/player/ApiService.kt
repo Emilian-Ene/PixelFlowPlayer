@@ -14,11 +14,85 @@ data class HeartbeatRequest(
     val deviceInfo: DeviceInfo // Always include device information
 )
 
-// Device information for better server-side management
+// --- Display / Video ---
+data class DisplayModeInfo(
+    val widthPx: Int,
+    val heightPx: Int,
+    val refreshRate: Float
+)
+
+data class DisplayInfo(
+    val currentWidthPx: Int,
+    val currentHeightPx: Int,
+    val densityDpi: Int,
+    val refreshRate: Float,
+    val rotation: Int,
+    val supportedModes: List<DisplayModeInfo>? = null
+)
+
+data class VideoCodecSupport(
+    val codec: String, // e.g., "video/avc", "video/hevc"
+    val maxWidth: Int,
+    val maxHeight: Int
+)
+
+// --- New system metrics ---
+data class StorageInfo(
+    val totalBytes: Long,
+    val freeBytes: Long,
+    val appCacheBytes: Long
+)
+
+data class MemoryInfoDto(
+    val totalRamBytes: Long,
+    val availRamBytes: Long,
+    val lowMemory: Boolean
+)
+
+data class BatteryInfo(
+    val levelPercent: Int?,
+    val charging: Boolean?,
+    val powerSave: Boolean?
+)
+
+data class NetworkInfoDto(
+    val online: Boolean,
+    val transports: List<String>,
+    val metered: Boolean?,
+    val validated: Boolean?,
+    val vpnActive: Boolean?
+)
+
+data class LocaleTimeInfo(
+    val timezone: String,
+    val locale: String,
+    val is24h: Boolean,
+    val uptimeMs: Long
+)
+
+data class PlayerStats(
+    val playlistHash: String?,
+    val itemCount: Int,
+    val currentIndex: Int,
+    val currentUrl: String?,
+    val currentType: String?,
+    val decoderName: String? = null,
+    val droppedFrames: Int? = null,
+    val lastDownloadErrors: List<String>? = null
+)
+
 data class DeviceInfo(
     val model: String,
     val androidVersion: String,
-    val appVersion: String
+    val appVersion: String,
+    val display: DisplayInfo? = null,
+    val videoSupport: List<VideoCodecSupport>? = null,
+    val storage: StorageInfo? = null,
+    val memory: MemoryInfoDto? = null,
+    val battery: BatteryInfo? = null,
+    val network: NetworkInfoDto? = null,
+    val localeTime: LocaleTimeInfo? = null,
+    val playerStats: PlayerStats? = null
 )
 
 // Response body returned by backend
