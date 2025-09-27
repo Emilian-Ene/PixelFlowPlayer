@@ -1,7 +1,9 @@
 package com.example.pixelflowplayer
 
 import android.app.ActivityManager
+import android.app.AlarmManager
 import android.app.AlertDialog
+import android.app.PendingIntent
 import android.app.admin.DevicePolicyManager
 import android.content.Context
 import android.annotation.SuppressLint
@@ -29,6 +31,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import android.widget.Toast
 import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.edit
@@ -65,6 +68,8 @@ import com.example.pixelflowplayer.player.NetworkInfoDto
 import com.example.pixelflowplayer.player.LocaleTimeInfo
 import com.example.pixelflowplayer.player.PlayerStats
 import com.example.pixelflowplayer.storage.StorageManager
+import com.example.pixelflowplayer.network.WebSocketManager
+import java.net.URI
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -82,6 +87,7 @@ import android.view.Surface
 import android.hardware.display.DisplayManager
 import android.view.Display
 import android.media.MediaCodecList
+import android.media.AudioManager
 
 @OptIn(UnstableApi::class)
 class MainActivity : AppCompatActivity() {
@@ -154,6 +160,22 @@ class MainActivity : AppCompatActivity() {
         private const val BASE_URL = "http://192.168.1.151:3000"
     }
 
+    // Track once-only skip notifications per filename
+    private val shownSkipToastKeys = mutableSetOf<String>()
+    private fun filenameKey(urlOrPath: String): String {
+        val base = urlOrPath.substringAfterLast('/')
+        val win = base.substringAfterLast('\\')
+        val cleaned = win.replace(Regex("^[0-9a-fA-F]{32}_"), "")
+        return cleaned.lowercase(Locale.getDefault())
+    }
+    private fun toastOnceFor(urlOrPath: String, msg: String) {
+        val key = filenameKey(urlOrPath)
+        val show = synchronized(shownSkipToastKeys) { shownSkipToastKeys.add(key) }
+        if (show) runOnUiThread { Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show() }
+    }
+
+    private var wsManager: WebSocketManager? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -170,6 +192,32 @@ class MainActivity : AppCompatActivity() {
         // Initialize SharedPreferences and device management (restored from old file)
         // val sharedPreferences = getSharedPreferences("PixelFlowPlayerPrefs", MODE_PRIVATE) // Unused
         deviceId = getOrCreateDeviceId()
+
+        // --- WebSocket connect & register ---
+        try {
+            val uri = URI(BASE_URL)
+            val host = uri.host ?: "192.168.1.151"
+            val port = if (uri.port > 0) uri.port else 3000
+            wsManager = WebSocketManager(host, port, deviceId)
+            wsManager?.connect()
+            val registerInfo = mapOf(
+                "deviceId" to deviceId,
+                "deviceInfo" to mapOf(
+                    "model" to Build.MANUFACTURER + " " + Build.MODEL,
+                    "androidVersion" to (Build.VERSION.RELEASE ?: Build.VERSION.SDK_INT.toString()),
+                    "appVersion" to getAppVersion(),
+                    "display" to collectDisplayInfo(),
+                    "videoSupport" to (collectVideoSupport() ?: emptyList())
+                )
+            )
+            wsManager?.setRegisterPayload(registerInfo)
+            wsManager?.sendJson("register", registerInfo)
+
+            // NEW: command handler
+            wsManager?.setCommandHandler { id, command, params ->
+                handleRemoteCommand(id, command, params)
+            }
+        } catch (_: Exception) {}
 
         // Initialize views (restored from old file)
         findViews()
@@ -715,6 +763,18 @@ class MainActivity : AppCompatActivity() {
 
                     val percent = if (urlsToTrack.isNotEmpty()) (completedCount * 100) / urlsToTrack.size else 100
                     val currentName = progressMap.entries.firstOrNull { it.value is DownloadProgress.InProgress }?.key?.substringAfterLast('/') ?: ""
+
+                    // NEW: emit realtime download progress
+                    try {
+                        wsManager?.sendJson("download_progress", mapOf(
+                            "completed" to completedCount,
+                            "failed" to failedCount,
+                            "total" to urlsToTrack.size,
+                            "percent" to percent,
+                            "currentName" to currentName
+                        ))
+                    } catch (_: Exception) {}
+
                     withContext(Dispatchers.Main) {
                         updateDownloadOverlay(completedCount, urlsToTrack.size, percent, currentName, errors)
                     }
@@ -916,6 +976,46 @@ class MainActivity : AppCompatActivity() {
         val item = currentPlaylistItems[currentItemIndex]
         Log.d(TAG, "🎬 Playing item ${currentItemIndex + 1}/${currentPlaylistItems.size}: ${item.url}")
 
+        // QUICK GUARD: ensure cached file exists before trying to play
+        if (item.url.startsWith("file://")) {
+            try {
+                val path = item.url.removePrefix("file://")
+                val f = File(path)
+                if (!f.exists() || f.length() == 0L) {
+                    Log.w(TAG, "Cached file missing/empty, skipping: $path")
+                    // Attempt to requeue original download by filename
+                    val cachedKey = filenameKey(item.url)
+                    val remote = lastRemotePlaylist?.items?.firstOrNull { filenameKey(it.url) == cachedKey }?.let {
+                        if (it.url.startsWith("http")) it.url else "$BASE_URL${it.url}"
+                    }
+                    if (remote != null) {
+                        CoroutineScope(Dispatchers.IO).launch {
+                            try {
+                                val req = DownloadRequest(url = remote, priority = DownloadPriority.HIGH, metadata = mapOf("type" to item.type))
+                                downloadManager.queueDownload(req)
+                            } catch (_: Exception) {}
+                        }
+                    }
+                    toastOnceFor(item.url, "Skipped missing file. Re-downloading…")
+                    handler.post { advanceToNextItem() }
+                    return
+                }
+            } catch (_: Exception) { /* ignore */ }
+        }
+
+        // Emit now_playing
+        try {
+            wsManager?.sendJson("now_playing", mapOf(
+                "index" to currentItemIndex,
+                // Use mediaType to avoid overriding the event type in WS
+                "mediaType" to item.type,
+                "url" to item.url,
+                "displayMode" to (item.displayMode ?: "contain"),
+                "rotation" to contentRotation,
+                "duration" to item.duration
+            ))
+        } catch (_: Exception) {}
+
         // Only play local cached items
         if (!item.url.startsWith("file://")) {
             Log.w(TAG, "Skipping non-local item: ${item.url}")
@@ -1007,6 +1107,27 @@ class MainActivity : AppCompatActivity() {
                     pairingView.visibility = View.GONE
                     playerContainer.visibility = View.VISIBLE
                     playerContainer.bringToFront()
+
+                    // NEW: when a video is ready, report its duration (seconds) to CMS for countdown
+                    try {
+                        val current = currentPlaylistItems.getOrNull(currentItemIndex)
+                        if (current != null && current.type.equals("video", ignoreCase = true)) {
+                            val durMs = exoPlayer?.duration ?: -1L
+                            if (durMs > 0) {
+                                val id = "${currentItemIndex}-${current.url}"
+                                wsManager?.sendJson("now_playing", mapOf(
+                                    "index" to currentItemIndex,
+                                    // include mediaType explicitly
+                                    "mediaType" to current.type,
+                                    "url" to current.url,
+                                    "displayMode" to (current.displayMode ?: "contain"),
+                                    "rotation" to contentRotation,
+                                    "duration" to (durMs / 1000).toInt(),
+                                    "id" to id
+                                ))
+                            }
+                        }
+                    } catch (_: Exception) {}
                 }
                 if (playbackState == Player.STATE_ENDED) {
                     advanceToNextItem()
@@ -1019,6 +1140,38 @@ class MainActivity : AppCompatActivity() {
                     playerContainer.visibility = View.VISIBLE
                     playerContainer.bringToFront()
                 }
+            }
+            // NEW: handle playback errors by deleting bad cache, re-queuing download, and skipping forward
+            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                Log.e(TAG, "Playback error", error)
+                val badItem = currentPlaylistItems.getOrNull(currentItemIndex)
+                if (badItem != null && badItem.url.startsWith("file://")) {
+                    try {
+                        val path = badItem.url.removePrefix("file://")
+                        val f = File(path)
+                        if (f.exists()) {
+                            f.delete()
+                            Log.w(TAG, "Deleted corrupt cached file: ${f.name}")
+                        }
+                    } catch (_: Exception) {}
+
+                    // Try to find the remote URL by filename match (strip optional md5_ prefix)
+                    val cachedKey = filenameKey(badItem.url)
+                    val remote = lastRemotePlaylist?.items?.firstOrNull { filenameKey(it.url) == cachedKey }?.let {
+                        if (it.url.startsWith("http")) it.url else "$BASE_URL${it.url}"
+                    }
+                    if (remote != null) {
+                        CoroutineScope(Dispatchers.IO).launch {
+                            try {
+                                val req = DownloadRequest(url = remote, priority = DownloadPriority.HIGH, metadata = mapOf("type" to badItem.type))
+                                downloadManager.queueDownload(req)
+                            } catch (_: Exception) {}
+                        }
+                    }
+                    toastOnceFor(badItem.url, "Skipped corrupt file. Re-downloading…")
+                }
+                // Skip to next item so UI doesn’t hang
+                handler.post { advanceToNextItem() }
             }
         })
     }
@@ -1045,6 +1198,8 @@ class MainActivity : AppCompatActivity() {
     private fun applyContentRotation(rotationDegrees: Int) {
         val rot = ((rotationDegrees % 360) + 360) % 360 // normalize
         Log.d(TAG, "Applying content rotation: $rot°")
+        // Remember the screen rotation coming from CMS so we can report it in now_playing
+        contentRotation = rot
         // Rotate both the image and video containers
         imagePlayerView.rotation = rot.toFloat()
         playerView.rotation = rot.toFloat()
@@ -1234,5 +1389,85 @@ class MainActivity : AppCompatActivity() {
             }
             results.map { (codec, wh) -> VideoCodecSupport(codec, wh.first, wh.second) }
         } catch (_: Exception) { null }
+    }
+
+    private fun handleRemoteCommand(id: String, command: String, params: Map<String, Any?>) {
+        when (command) {
+            "force_update", "reload_playlist" -> {
+                runOnUiThread {
+                    val pl = lastRemotePlaylist
+                    if (pl != null) {
+                        downloadAndPlayPlaylist(pl, force = true)
+                        try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok")) } catch (_: Exception) {}
+                    } else {
+                        try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "error", "error" to "no_playlist")) } catch (_: Exception) {}
+                    }
+                }
+            }
+            "clear_cache" -> {
+                lifecycleScope.launch(Dispatchers.IO) {
+                    try { storageManager.clearCache() } catch (_: Exception) {}
+                    withContext(Dispatchers.Main) {
+                        stopVideoPlayback()
+                        currentPlaylistItems = emptyList()
+                        currentItemIndex = 0
+                        try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok")) } catch (_: Exception) {}
+                    }
+                }
+            }
+            "set_volume" -> {
+                try {
+                    val level = (params["level"] as? Number)?.toInt() ?: 50
+                    val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                    val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                    val vol = (level * max / 100).coerceIn(0, max)
+                    am.setStreamVolume(AudioManager.STREAM_MUSIC, vol, 0)
+                    wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok", "data" to mapOf("level" to level)))
+                } catch (e: Exception) {
+                    try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "error", "error" to e.message)) } catch (_: Exception) {}
+                }
+            }
+            
+            "next_item" -> {
+                runOnUiThread { advanceToNextItem() }
+                try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok")) } catch (_: Exception) {}
+            }
+            "set_rotation" -> {
+                val deg = (params["degrees"] as? Number)?.toInt() ?: 0
+                runOnUiThread { applyContentRotation(deg) }
+                try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok")) } catch (_: Exception) {}
+            }
+            "restart_app" -> {
+                // Ack first, then schedule a safe restart
+                try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok")) } catch (_: Exception) {}
+                runOnUiThread { scheduleAppRestart(600) }
+            }
+            else -> {
+                try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "error", "error" to "unsupported_command")) } catch (_: Exception) {}
+            }
+        }
+    }
+
+    private fun scheduleAppRestart(delayMs: Long = 500) {
+        try {
+            val ctx = applicationContext
+            val intent = packageManager?.getLaunchIntentForPackage(packageName)
+            if (intent != null) {
+                intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NEW_TASK)
+                val pi = PendingIntent.getActivity(
+                    ctx,
+                    0,
+                    intent,
+                    PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                am.set(AlarmManager.RTC, System.currentTimeMillis() + delayMs, pi)
+            }
+        } catch (_: Exception) { }
+        // Try to close gracefully
+        try { exoPlayer?.release() } catch (_: Exception) {}
+        try { finishAndRemoveTask() } catch (_: Exception) { finishAffinity() }
+        try { android.os.Process.killProcess(android.os.Process.myPid()) } catch (_: Exception) {}
+        try { System.exit(0) } catch (_: Exception) {}
     }
 }

@@ -363,6 +363,13 @@ class DownloadManager(
                             onProgress(progress, status)
                         }
                         output.flush()
+                        // STRICT SIZE CHECK: if server provided Content-Length, ensure we got all bytes
+                        if (contentLength > 0 && totalBytes != contentLength) {
+                            try { output.close() } catch (_: Exception) {}
+                            try { targetFile.delete() } catch (_: Exception) {}
+                            connection.disconnect()
+                            return@withContext DownloadResult.Error("Truncated download: got $totalBytes of $contentLength bytes")
+                        }
                     }
                 }
             }
