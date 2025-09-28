@@ -94,6 +94,16 @@ import android.hardware.display.DisplayManager
 import android.view.Display
 import android.media.MediaCodecList
 import android.media.AudioManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.view.TextureView
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import okhttp3.OkHttpClient
+import okhttp3.MultipartBody
+import okhttp3.Request
+import okhttp3.RequestBody
+import okhttp3.MediaType.Companion.toMediaType
 import com.example.pixelflowplayer.admin.DeviceAdminReceiver as PfpDeviceAdminReceiver
 
 @OptIn(UnstableApi::class)
@@ -162,6 +172,9 @@ class MainActivity : AppCompatActivity() {
     // Prevent overlapping clear-cache operations
     @Volatile private var isClearingCache: Boolean = false
 
+    // Flag to stop new work when app is about to restart/finish
+    @Volatile private var isShuttingDown: Boolean = false
+
     // Transient controls (exit button) visibility handler
     private val controlsHandler = Handler(Looper.getMainLooper())
     private val hideControlsRunnable = Runnable { exitButton.visibility = View.GONE }
@@ -218,7 +231,7 @@ class MainActivity : AppCompatActivity() {
             val uri = URI(BASE_URL)
             val host = uri.host ?: "192.168.1.151"
             val port = if (uri.port > 0) uri.port else 3000
-            wsManager = WebSocketManager(host, port, deviceId)
+            wsManager = WebSocketManager.getInstance(host, port, deviceId)
             wsManager?.connect()
             // Wire remote command handling
             wsManager?.setCommandHandler { cmdId, command, params ->
@@ -567,16 +580,20 @@ class MainActivity : AppCompatActivity() {
                                         }
                                         // Background retry for any failed items still missing
                                         try {
-                                            val allUrls = newPlaylistFromServer.items.map { item ->
+                                            val allUrls = newPlaylistFromServer.items.map { item -> 
                                                 if (item.url.startsWith("http")) item.url else "$BASE_URL${item.url}"
                                             }.toSet()
                                             retryFailedInBackground(allUrls)
                                         } catch (_: Exception) {}
                                     }
                                 } else if (heartbeatResponse.playlist == null) {
-                                    // Playlist was removed on server, stop playback
+                                    // Playlist was removed on server, stop playback and clear local snapshot
                                     withContext(Dispatchers.Main) {
                                         if (downloadProgressView.isVisible) downloadProgressView.visibility = View.GONE
+                                        stopVideoPlayback()
+                                        currentPlaylistItems = emptyList()
+                                        currentItemIndex = 0
+                                        getSharedPreferences("PixelFlowPlayerPrefs", MODE_PRIVATE).edit { remove("localPlaylist") }
                                         showPairedScreen()
                                     }
                                 }
@@ -937,6 +954,7 @@ class MainActivity : AppCompatActivity() {
     private fun startPlayback(playlist: Playlist) {
         Log.d(TAG, "🎬 startPlayback() with ${playlist.items.size} items")
         runOnUiThread {
+            if (!isActivityAlive()) return@runOnUiThread
             // Belt-and-suspenders: whenever playback starts, ensure overlay is gone and player is visible
             pairingView.visibility = View.GONE
             isBlockingOnDownload = false
@@ -955,6 +973,12 @@ class MainActivity : AppCompatActivity() {
                 showPairedScreen()
             }
         }
+    }
+
+    private fun isActivityAlive(): Boolean {
+        if (isShuttingDown) return false
+        if (isFinishing) return false
+        return !(Build.VERSION.SDK_INT >= 17 && isDestroyed)
     }
 
     private fun setupFullscreen() {
@@ -1093,6 +1117,8 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        if (!isActivityAlive()) return
+
         // Ensure UI state
         handler.removeCallbacksAndMessages(null)
         loadingBar.visibility = View.GONE
@@ -1102,7 +1128,7 @@ class MainActivity : AppCompatActivity() {
         playerContainer.bringToFront()
 
         val item = currentPlaylistItems[currentItemIndex]
-        Log.d(TAG, "🎬 Playing item ${currentItemIndex + 1}/${currentPlaylistItems.size}: ${item.url}")
+        Log.d(TAG, "🎬 Playing item ${currentPlaylistItems.size.takeIf { it>0 }?.let { currentItemIndex + 1 } ?: 0}/${currentPlaylistItems.size}: ${item.url}")
 
         // QUICK GUARD: ensure cached file exists before trying to play
         if (item.url.startsWith("file://")) {
@@ -1117,6 +1143,8 @@ class MainActivity : AppCompatActivity() {
                 }
             } catch (_: Exception) { /* ignore */ }
         }
+
+        if (!isActivityAlive()) return
 
         // Emit now_playing
         try {
@@ -1204,7 +1232,9 @@ class MainActivity : AppCompatActivity() {
             imagePlayerView.visibility = View.VISIBLE
             applyImageDisplayMode(item.displayMode)
             try {
-                Glide.with(this).load(item.url).into(imagePlayerView)
+                if (!isActivityAlive()) return
+                // Bind to the ImageView lifecycle to avoid using a destroyed Activity
+                Glide.with(imagePlayerView).load(item.url).into(imagePlayerView)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to load image", e)
                 handler.post { advanceToNextItem() }
@@ -1214,6 +1244,15 @@ class MainActivity : AppCompatActivity() {
             imageAdvanceRunnable = Runnable { advanceToNextItem() }
             handler.postDelayed(imageAdvanceRunnable!!, seconds * 1000L)
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        isShuttingDown = true
+        try { handler.removeCallbacksAndMessages(null) } catch (_: Exception) {}
+        try { Glide.with(applicationContext).clear(imagePlayerView) } catch (_: Exception) {}
+        try { wsManager?.disconnect() } catch (_: Exception) {}
+        wsManager = null
     }
 
     private fun initializePlayer() {
@@ -1505,18 +1544,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleRemoteCommand(id: String, command: String, params: Map<String, Any?>) {
+        // Log at debug here; WebSocketManager already logs a single INFO line per command
+        Log.d(TAG, "CMS command received: $command params=$params")
         when (command) {
             "force_update", "reload_playlist" -> {
-                Log.i(TAG, "CMS command: FORCE UPDATE")
+                // Send immediate result to CMS
+                try { wsManager?.sendJson("command_result", mapOf("id" to id, "command" to command, "status" to "ok")) } catch (_: Exception) {}
                 runOnUiThread {
                     // Immediately fetch latest state from server, then apply
                     fetchAndApplyLatestPlaylist(id)
                 }
             }
             "clear_cache" -> {
-                Log.i(TAG, "CMS command: CLEAR CACHE")
                 if (isClearingCache) {
-                    try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok", "note" to "already_clearing")) } catch (_: Exception) {}
+                    try { wsManager?.sendJson("command_result", mapOf("id" to id, "command" to command, "status" to "ok", "note" to "already_clearing")) } catch (_: Exception) {}
                     return
                 }
                 isClearingCache = true
@@ -1543,7 +1584,7 @@ class MainActivity : AppCompatActivity() {
                             stopVideoPlayback()
                             currentPlaylistItems = emptyList()
                             currentItemIndex = 0
-                            try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok")) } catch (_: Exception) {}
+                            try { wsManager?.sendJson("command_result", mapOf("id" to id, "command" to command, "status" to "ok")) } catch (_: Exception) {}
                             // Immediately fetch latest content so playback can resume without waiting for heartbeat
                             try { fetchAndApplyLatestPlaylist(null) } catch (_: Exception) {}
                         }
@@ -1560,18 +1601,20 @@ class MainActivity : AppCompatActivity() {
                     else -> 50f
                 }
                 val perc = if (pct <= 1f) (pct * 100f) else pct
-                Log.i(TAG, "CMS command: SET VOLUME to ${perc.coerceIn(0f,100f).toInt()}%")
-                try {
-                    val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                    val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
-                    val target = (perc.coerceIn(0f, 100f) / 100f * max).toInt().coerceIn(0, max)
-                    am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
-                    // Also set ExoPlayer volume immediately (0..1)
-                    val exoVol = target.toFloat() / max.toFloat()
-                    exoPlayer?.volume = exoVol
-                    try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok", "level" to (perc.coerceIn(0f,100f).toInt()))) } catch (_: Exception) {}
-                } catch (e: Exception) {
-                    try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "error", "error" to (e.message ?: "error"))) } catch (_: Exception) {}
+                // Run volume change on main thread to avoid thread errors
+                runOnUiThread {
+                    try {
+                        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                        val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                        val target = (perc.coerceIn(0f, 100f) / 100f * max).toInt().coerceIn(0, max)
+                        am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
+                        // Also set ExoPlayer volume immediately (0..1)
+                        val exoVol = target.toFloat() / max.toFloat()
+                        exoPlayer?.volume = exoVol
+                        try { wsManager?.sendJson("command_result", mapOf("id" to id, "command" to command, "status" to "ok", "level" to (perc.coerceIn(0f,100f).toInt()))) } catch (_: Exception) {}
+                    } catch (e: Exception) {
+                        try { wsManager?.sendJson("command_result", mapOf("id" to id, "command" to command, "status" to "error", "error" to (e.message ?: "error"))) } catch (_: Exception) {}
+                    }
                 }
             }
             "request_now_playing" -> {
@@ -1594,9 +1637,81 @@ class MainActivity : AppCompatActivity() {
                             "sentAt" to System.currentTimeMillis()
                         ))
                     }
-                    try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok")) } catch (_: Exception) {}
+                    try { wsManager?.sendJson("command_result", mapOf("id" to id, "command" to command, "status" to "ok")) } catch (_: Exception) {}
                 } catch (e: Exception) {
-                    try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "error", "error" to (e.message ?: "error"))) } catch (_: Exception) {}
+                    try { wsManager?.sendJson("command_result", mapOf("id" to id, "command" to command, "status" to "error", "error" to (e.message ?: "error"))) } catch (_: Exception) {}
+                }
+            }
+            "screenshot" -> {
+                lifecycleScope.launch(Dispatchers.IO) {
+                    try {
+                        // 1) Capture bitmap from current visible view (video or image)
+                        val bmp: Bitmap? = try {
+                            // Prefer TextureView bitmap from PlayerView if visible
+                            var candidate: Bitmap? = null
+                            if (playerView.visibility == View.VISIBLE) {
+                                val vs = playerView.videoSurfaceView
+                                if (vs is TextureView) {
+                                    candidate = vs.bitmap
+                                } else {
+                                    // Fallback: draw PlayerView to bitmap
+                                    val b = Bitmap.createBitmap(playerView.width.coerceAtLeast(1), playerView.height.coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+                                    val c = Canvas(b)
+                                    playerView.draw(c)
+                                    candidate = b
+                                }
+                            } else if (imagePlayerView.visibility == View.VISIBLE && imagePlayerView.width > 0 && imagePlayerView.height > 0) {
+                                val b = Bitmap.createBitmap(imagePlayerView.width, imagePlayerView.height, Bitmap.Config.ARGB_8888)
+                                val c = Canvas(b)
+                                imagePlayerView.draw(c)
+                                candidate = b
+                            }
+                            candidate
+                        } catch (_: Exception) { null }
+
+                        if (bmp == null) throw RuntimeException("screenshot_failed")
+
+                        // 2) Downscale to max 1080p on longest edge to save bandwidth
+                        val maxEdge = 1080
+                        val scaled: Bitmap = try {
+                            val w = bmp.width
+                            val h = bmp.height
+                            val scale = maxOf(w, h).toFloat() / maxEdge.toFloat()
+                            if (scale > 1f) {
+                                val nw = (w / scale).toInt().coerceAtLeast(1)
+                                val nh = (h / scale).toInt().coerceAtLeast(1)
+                                Bitmap.createScaledBitmap(bmp, nw, nh, true)
+                            } else bmp
+                        } catch (_: Exception) { bmp }
+
+                        // 3) Encode JPEG
+                        val bos = ByteArrayOutputStream()
+                        scaled.compress(Bitmap.CompressFormat.JPEG, 80, bos)
+                        val bytes = bos.toByteArray()
+                        try { if (scaled !== bmp) bmp.recycle() } catch (_: Exception) {}
+
+                        // 4) Upload via OkHttp multipart
+                        val client = OkHttpClient()
+                        val url = "$BASE_URL/api/devices/$deviceId/screenshot"
+                        val reqBody = MultipartBody.Builder().setType(MultipartBody.FORM)
+                            .addFormDataPart(
+                                "file",
+                                "screenshot.jpg",
+                                RequestBody.create("image/jpeg".toMediaType(), bytes)
+                            ).build()
+                        val req = Request.Builder().url(url).post(reqBody).build()
+                        val resp = client.newCall(req).execute()
+                        if (!resp.isSuccessful) throw RuntimeException("upload_failed ${resp.code}")
+                        val body = resp.body?.string() ?: "{}"
+                        val link = try {
+                            val obj = JSONObject(body)
+                            obj.optString("url").takeIf { it.isNotEmpty() }
+                        } catch (_: Exception) { null }
+                        // 5) Report back via WS
+                        try { wsManager?.sendJson("command_result", mapOf("id" to id, "command" to command, "status" to "ok", "url" to link)) } catch (_: Exception) {}
+                    } catch (e: Exception) {
+                        try { wsManager?.sendJson("command_result", mapOf("id" to id, "command" to command, "status" to "error", "error" to (e.message ?: "error"))) } catch (_: Exception) {}
+                    }
                 }
             }
             "clear_app_data" -> {
@@ -1616,7 +1731,7 @@ class MainActivity : AppCompatActivity() {
                                         try {
                                             wsManager?.sendJson(
                                                 "command_result",
-                                                mapOf("id" to id, "status" to if (succeeded) "ok" else "error", "error" to if (succeeded) null else "failed")
+                                                mapOf("id" to id, "command" to command, "status" to if (succeeded) "ok" else "error", "error" to if (succeeded) null else "failed")
                                             )
                                         } catch (_: Exception) {}
                                     }
@@ -1632,34 +1747,36 @@ class MainActivity : AppCompatActivity() {
                                     Boolean::class.javaPrimitiveType
                                 )
                                 val result = method.invoke(dpm, adminComponent(), packageName, false) as? Boolean ?: false
-                                try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to if (result) "ok" else "error")) } catch (_: Exception) {}
+                                try { wsManager?.sendJson("command_result", mapOf("id" to id, "command" to command, "status" to if (result) "ok" else "error")) } catch (_: Exception) {}
                             } catch (e: Exception) {
-                                try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "error", "error" to (e.message ?: "error"))) } catch (_: Exception) {}
+                                try { wsManager?.sendJson("command_result", mapOf("id" to id, "command" to command, "status" to "error", "error" to (e.message ?: "error"))) } catch (_: Exception) {}
                             }
                         }
                     } else {
-                        wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "error", "error" to "not_owner"))
+                        wsManager?.sendJson("command_result", mapOf("id" to id, "command" to command, "status" to "error", "error" to "not_owner"))
                     }
                 } catch (e: Exception) {
-                    try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "error", "error" to (e.message ?: "error"))) } catch (_: Exception) {}
+                    try { wsManager?.sendJson("command_result", mapOf("id" to id, "command" to command, "status" to "error", "error" to (e.message ?: "error"))) } catch (_: Exception) {}
                 }
             }
             "restart_app" -> {
-                Log.i(TAG, "CMS command: RESTART APP")
                 // Ack first, then schedule a safe restart
-                try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok")) } catch (_: Exception) {}
-                runOnUiThread { scheduleAppRestart(600) }
+                try { wsManager?.sendJson("command_result", mapOf("id" to id, "command" to command, "status" to "ok")) } catch (_: Exception) {}
+                runOnUiThread {
+                    // Stop any future work before we restart
+                    isShuttingDown = true
+                    try { handler.removeCallbacksAndMessages(null) } catch (_: Exception) {}
+                    imageAdvanceRunnable?.let { try { handler.removeCallbacks(it) } catch (_: Exception) {} }
+                    imageAdvanceRunnable = null
+                    try { stopVideoPlayback() } catch (_: Exception) {}
+                    try { Glide.with(applicationContext).clear(imagePlayerView) } catch (_: Exception) {}
+                    scheduleAppRestart(600)
+                }
             }
             else -> {
-                try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "error", "error" to "unsupported_command")) } catch (_: Exception) {}
+                try { wsManager?.sendJson("command_result", mapOf("id" to id, "command" to command, "status" to "error", "error" to "unsupported_command")) } catch (_: Exception) {}
             }
         }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        try { wsManager?.disconnect() } catch (_: Exception) {}
-        wsManager = null
     }
 
     // Fetch latest playlist/rotation via heartbeat and apply instantly
