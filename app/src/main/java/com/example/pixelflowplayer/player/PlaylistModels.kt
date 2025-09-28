@@ -61,5 +61,6 @@ data class PlaylistItem(
     val displayMode: String? = "contain", // "contain" | "cover" | "fill"
     val width: Int = 0,
     val height: Int = 0,
-    val aspectRatio: Double? = null   // optional: width/height when available
+    val aspectRatio: Double? = null,   // optional: width/height when available
+    val displayName: String? = null    // NEW: human-friendly name from CMS
 )

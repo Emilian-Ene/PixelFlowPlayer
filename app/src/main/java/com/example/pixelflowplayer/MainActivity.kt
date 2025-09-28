@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.admin.DevicePolicyManager
 import android.content.Context
 import android.annotation.SuppressLint
+import android.content.ComponentName
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ActivityInfo
@@ -77,6 +78,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.cancel
 import java.io.File
 import java.security.MessageDigest
 import java.util.Locale
@@ -88,6 +92,7 @@ import android.hardware.display.DisplayManager
 import android.view.Display
 import android.media.MediaCodecList
 import android.media.AudioManager
+import com.example.pixelflowplayer.admin.DeviceAdminReceiver as PfpDeviceAdminReceiver
 
 @OptIn(UnstableApi::class)
 class MainActivity : AppCompatActivity() {
@@ -146,6 +151,9 @@ class MainActivity : AppCompatActivity() {
     private var downloadProgressJob: Job? = null
     private var playbackStartedFromDownloads = false
     private var isBlockingOnDownload: Boolean = false
+    
+    // Prevent overlapping clear-cache operations
+    @Volatile private var isClearingCache: Boolean = false
 
     // Transient controls (exit button) visibility handler
     private val controlsHandler = Handler(Looper.getMainLooper())
@@ -169,10 +177,15 @@ class MainActivity : AppCompatActivity() {
         return cleaned.lowercase(Locale.getDefault())
     }
     private fun toastOnceFor(urlOrPath: String, msg: String) {
+        // Suppress user-facing toasts; keep a one-time log entry only
         val key = filenameKey(urlOrPath)
-        val show = synchronized(shownSkipToastKeys) { shownSkipToastKeys.add(key) }
-        if (show) runOnUiThread { Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show() }
+        val first = synchronized(shownSkipToastKeys) { shownSkipToastKeys.add(key) }
+        if (first) Log.i(TAG, msg)
     }
+
+    // NEW: de-dup now_playing emissions per item
+    private var lastNowPlayingKey: String? = null
+    private var sentReadyUpdateForKey: Boolean = false
 
     private var wsManager: WebSocketManager? = null
 
@@ -320,8 +333,10 @@ class MainActivity : AppCompatActivity() {
 
         if (currentlyPaired) {
             val localPlaylist = getLocalPlaylist()
-            if (localPlaylist != null && localPlaylist.items.isNotEmpty()) {
-                startPlayback(localPlaylist)
+            // IMPORTANT: Map to cached file:// URLs; do not try to play remote URLs when server is down
+            val playable = localPlaylist?.let { buildLocalPlaylistFromCache(it) }
+            if (playable != null && playable.items.isNotEmpty()) {
+                startPlayback(playable)
             } else {
                 showPairedScreen()
             }
@@ -451,6 +466,9 @@ class MainActivity : AppCompatActivity() {
                                 downloadProgressJob?.cancel(); downloadProgressJob = null
                                 playbackStartedFromDownloads = false
                                 playlistUpdateInProgress = false
+                                // NEW: fully reset remote snapshot and toasts
+                                lastRemotePlaylist = null
+                                synchronized(shownSkipToastKeys) { shownSkipToastKeys.clear() }
                                 withContext(Dispatchers.Main) {
                                     if (downloadProgressView.isVisible) downloadProgressView.visibility = View.GONE
                                     // Stop playback and reset in-memory list
@@ -513,7 +531,8 @@ class MainActivity : AppCompatActivity() {
                                         Log.d(TAG, getString(R.string.log_new_playlist_detected))
                                         playlistUpdateInProgress = true
                                         withContext(Dispatchers.Main) {
-                                            downloadAndPlayPlaylist(newPlaylistFromServer)
+                                            // CMS changed the playlist → purge old cache first, then download all new items
+                                            downloadAndPlayPlaylist(newPlaylistFromServer, force = true, purgeBefore = true)
                                         }
                                     } else if (!playlistContentHasChanged) {
                                         val localPlaylist = getLocalPlaylist()
@@ -640,7 +659,7 @@ class MainActivity : AppCompatActivity() {
     /**
      * 📥 Download all playlist items first, then start playback (enhanced for Playlist object)
      */
-    private fun downloadAndPlayPlaylist(newPlaylist: Playlist, force: Boolean = false) {
+    private fun downloadAndPlayPlaylist(newPlaylist: Playlist, force: Boolean = false, purgeBefore: Boolean = false) {
         if (!force && lastRemotePlaylist?.isContentEqualTo(newPlaylist) == true) {
             Log.d(TAG, getString(R.string.log_playlist_unchanged))
             playlistUpdateInProgress = false
@@ -663,10 +682,19 @@ class MainActivity : AppCompatActivity() {
         }.toSet()
 
         lifecycleScope.launch(Dispatchers.IO) {
-            val missingUrls = allTargetUrls.filter { url ->
-                val f = storageManager.getCacheFile(url)
-                !f.exists() || f.length() == 0L
-            }.toSet()
+            if (purgeBefore) {
+                try { storageManager.clearCache() } catch (_: Exception) {}
+                // remove saved local playlist snapshot
+                getSharedPreferences("PixelFlowPlayerPrefs", MODE_PRIVATE).edit { remove("localPlaylist") }
+            }
+            val missingUrls = if (purgeBefore) {
+                allTargetUrls
+            } else {
+                allTargetUrls.filter { url ->
+                    val f = storageManager.getCacheFile(url)
+                    !f.exists() || f.length() == 0L
+                }.toSet()
+            }
 
             // If nothing is missing, do not show the blocking download UI. Just rebuild and play.
             if (missingUrls.isEmpty()) {
@@ -749,12 +777,13 @@ class MainActivity : AppCompatActivity() {
     /**
      * 🔄 Monitor download progress and start playback when ready
      */
-    private fun monitorDownloadProgress(urlsToTrack: Set<String>) {
-        downloadProgressJob?.cancel()
+    private suspend fun monitorDownloadProgress(urlsToTrack: Set<String>) {
+        // Ensure only one collector is active
+        try { downloadProgressJob?.cancelAndJoin() } catch (_: CancellationException) {}
+        val errors = mutableListOf<String>()
         downloadProgressJob = CoroutineScope(Dispatchers.IO).launch {
-            val errors = mutableListOf<String>()
-            downloadManager.downloadProgress
-                .collect { progressMap ->
+            try {
+                downloadManager.downloadProgress.collect { progressMap ->
                     val completedCount = urlsToTrack.count { url ->
                         val file = storageManager.getCacheFile(url)
                         file.exists() && file.length() > 0 || progressMap[url] is DownloadProgress.Completed
@@ -762,44 +791,50 @@ class MainActivity : AppCompatActivity() {
                     val failedCount = urlsToTrack.count { url -> progressMap[url] is DownloadProgress.Failed }
 
                     val percent = if (urlsToTrack.isNotEmpty()) (completedCount * 100) / urlsToTrack.size else 100
-                    val currentName = progressMap.entries.firstOrNull { it.value is DownloadProgress.InProgress }?.key?.substringAfterLast('/') ?: ""
+                    val inProgUrl = progressMap.entries.firstOrNull { it.value is DownloadProgress.InProgress }?.key
+                    val fileBase = inProgUrl?.substringAfterLast('/')?.substringAfterLast('\\') ?: ""
+                    val cleaned = fileBase.replace(Regex("^[0-9a-fA-F]{32}_"), "")
+                    val currentNameFriendly = try {
+                        val match = lastRemotePlaylist?.items?.firstOrNull { it.url.substringAfterLast('/')
+                            .substringAfterLast('\\')
+                            .endsWith(cleaned, ignoreCase = true) }
+                        match?.displayName ?: cleaned
+                    } catch (_: Exception) { cleaned }
 
-                    // NEW: emit realtime download progress
+                    // Emit realtime progress to CMS (keep filename for mapping there)
                     try {
                         wsManager?.sendJson("download_progress", mapOf(
                             "completed" to completedCount,
                             "failed" to failedCount,
                             "total" to urlsToTrack.size,
                             "percent" to percent,
-                            "currentName" to currentName
+                            "currentName" to fileBase
                         ))
                     } catch (_: Exception) {}
 
                     withContext(Dispatchers.Main) {
-                        updateDownloadOverlay(completedCount, urlsToTrack.size, percent, currentName, errors)
+                        updateDownloadOverlay(completedCount, urlsToTrack.size, percent, currentNameFriendly, errors)
                     }
 
-                    // When all items finished (completed + failed), start playback with cached-only items
                     if (completedCount + failedCount >= urlsToTrack.size) {
-                        Log.d(TAG, "Downloads finished. Completed=$completedCount, Failed=$failedCount. Starting with cached items only.")
-                        // Give the filesystem a moment to flush writes before we scan cache
+                        // All done: small delay to flush writes, then hand off to playback
                         delay(350)
                         val freshPlaylist = (lastRemotePlaylist ?: getLocalPlaylist())?.let { buildLocalPlaylistFromCache(it) }
-                        Log.d(TAG, "🔍 freshPlaylist items after cache scan: ${freshPlaylist?.items?.size ?: 0}")
                         withContext(Dispatchers.Main) {
                             isBlockingOnDownload = false
                             hideDownloadOverlay()
-                            if (freshPlaylist != null && freshPlaylist.items.isNotEmpty()) {
-                                startPlayback(freshPlaylist)
-                            } else {
-                                // Nothing cached → show paired/waiting
-                                showPairedScreen(instructions = getString(R.string.status_no_items_to_play))
-                            }
+                            if (freshPlaylist != null && freshPlaylist.items.isNotEmpty()) startPlayback(freshPlaylist) else showPairedScreen(instructions = getString(R.string.status_no_items_to_play))
                         }
                         playlistUpdateInProgress = false
-                        downloadProgressJob?.cancel()
+                        // Cancel this monitor gracefully
+                        cancel()
                     }
                 }
+            } catch (_: CancellationException) {
+                // normal lifecycle: monitor replaced or UI closed
+            } catch (e: Exception) {
+                Log.e(TAG, "Download monitor error", e)
+            }
         }
     }
 
@@ -983,20 +1018,7 @@ class MainActivity : AppCompatActivity() {
                 val f = File(path)
                 if (!f.exists() || f.length() == 0L) {
                     Log.w(TAG, "Cached file missing/empty, skipping: $path")
-                    // Attempt to requeue original download by filename
-                    val cachedKey = filenameKey(item.url)
-                    val remote = lastRemotePlaylist?.items?.firstOrNull { filenameKey(it.url) == cachedKey }?.let {
-                        if (it.url.startsWith("http")) it.url else "$BASE_URL${it.url}"
-                    }
-                    if (remote != null) {
-                        CoroutineScope(Dispatchers.IO).launch {
-                            try {
-                                val req = DownloadRequest(url = remote, priority = DownloadPriority.HIGH, metadata = mapOf("type" to item.type))
-                                downloadManager.queueDownload(req)
-                            } catch (_: Exception) {}
-                        }
-                    }
-                    toastOnceFor(item.url, "Skipped missing file. Re-downloading…")
+                    // Silent skip: do NOT show a toast
                     handler.post { advanceToNextItem() }
                     return
                 }
@@ -1005,15 +1027,20 @@ class MainActivity : AppCompatActivity() {
 
         // Emit now_playing
         try {
-            wsManager?.sendJson("now_playing", mapOf(
-                "index" to currentItemIndex,
-                // Use mediaType to avoid overriding the event type in WS
-                "mediaType" to item.type,
-                "url" to item.url,
-                "displayMode" to (item.displayMode ?: "contain"),
-                "rotation" to contentRotation,
-                "duration" to item.duration
-            ))
+            val key = "${currentItemIndex}-${item.url}"
+            if (lastNowPlayingKey != key) {
+                wsManager?.sendJson("now_playing", mapOf(
+                    "index" to currentItemIndex,
+                    // Use mediaType to avoid overriding the event type in WS
+                    "mediaType" to item.type,
+                    "url" to item.url,
+                    "displayMode" to (item.displayMode ?: "contain"),
+                    "rotation" to contentRotation,
+                    "duration" to item.duration
+                ))
+                lastNowPlayingKey = key
+                sentReadyUpdateForKey = false
+            }
         } catch (_: Exception) {}
 
         // Only play local cached items
@@ -1108,23 +1135,25 @@ class MainActivity : AppCompatActivity() {
                     playerContainer.visibility = View.VISIBLE
                     playerContainer.bringToFront()
 
-                    // NEW: when a video is ready, report its duration (seconds) to CMS for countdown
+                    // NEW: when a video is ready, send one-time metadata update (duration) without duplicating now_playing
                     try {
                         val current = currentPlaylistItems.getOrNull(currentItemIndex)
                         if (current != null && current.type.equals("video", ignoreCase = true)) {
                             val durMs = exoPlayer?.duration ?: -1L
                             if (durMs > 0) {
-                                val id = "${currentItemIndex}-${current.url}"
-                                wsManager?.sendJson("now_playing", mapOf(
-                                    "index" to currentItemIndex,
-                                    // include mediaType explicitly
-                                    "mediaType" to current.type,
-                                    "url" to current.url,
-                                    "displayMode" to (current.displayMode ?: "contain"),
-                                    "rotation" to contentRotation,
-                                    "duration" to (durMs / 1000).toInt(),
-                                    "id" to id
-                                ))
+                                val key = "${currentItemIndex}-${current.url}"
+                                if (lastNowPlayingKey == key && !sentReadyUpdateForKey) {
+                                    wsManager?.sendJson("now_playing_update", mapOf(
+                                        "index" to currentItemIndex,
+                                        "mediaType" to current.type,
+                                        "url" to current.url,
+                                        "displayMode" to (current.displayMode ?: "contain"),
+                                        "rotation" to contentRotation,
+                                        "duration" to (durMs / 1000).toInt(),
+                                        "id" to key
+                                    ))
+                                    sentReadyUpdateForKey = true
+                                }
                             }
                         }
                     } catch (_: Exception) {}
@@ -1150,27 +1179,14 @@ class MainActivity : AppCompatActivity() {
                         val path = badItem.url.removePrefix("file://")
                         val f = File(path)
                         if (f.exists()) {
+                            // Remove corrupt file to avoid repeated failures; no toast
                             f.delete()
                             Log.w(TAG, "Deleted corrupt cached file: ${f.name}")
                         }
                     } catch (_: Exception) {}
-
-                    // Try to find the remote URL by filename match (strip optional md5_ prefix)
-                    val cachedKey = filenameKey(badItem.url)
-                    val remote = lastRemotePlaylist?.items?.firstOrNull { filenameKey(it.url) == cachedKey }?.let {
-                        if (it.url.startsWith("http")) it.url else "$BASE_URL${it.url}"
-                    }
-                    if (remote != null) {
-                        CoroutineScope(Dispatchers.IO).launch {
-                            try {
-                                val req = DownloadRequest(url = remote, priority = DownloadPriority.HIGH, metadata = mapOf("type" to badItem.type))
-                                downloadManager.queueDownload(req)
-                            } catch (_: Exception) {}
-                        }
-                    }
-                    toastOnceFor(badItem.url, "Skipped corrupt file. Re-downloading…")
+                    // Silent skip: no toast
                 }
-                // Skip to next item so UI doesn’t hang
+                // Skip to next item so UI doesn’t hang (no auto re-download)
                 handler.post { advanceToNextItem() }
             }
         })
@@ -1391,51 +1407,120 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) { null }
     }
 
+    private fun adminComponent(): ComponentName {
+        return ComponentName(this, PfpDeviceAdminReceiver::class.java)
+    }
+
     private fun handleRemoteCommand(id: String, command: String, params: Map<String, Any?>) {
         when (command) {
             "force_update", "reload_playlist" -> {
                 runOnUiThread {
-                    val pl = lastRemotePlaylist
-                    if (pl != null) {
-                        downloadAndPlayPlaylist(pl, force = true)
-                        try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok")) } catch (_: Exception) {}
-                    } else {
-                        try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "error", "error" to "no_playlist")) } catch (_: Exception) {}
-                    }
+                    // Immediately fetch latest state from server, then apply
+                    fetchAndApplyLatestPlaylist(id)
                 }
             }
             "clear_cache" -> {
+                if (isClearingCache) {
+                    try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok", "note" to "already_clearing")) } catch (_: Exception) {}
+                    return
+                }
+                isClearingCache = true
                 lifecycleScope.launch(Dispatchers.IO) {
-                    try { storageManager.clearCache() } catch (_: Exception) {}
-                    withContext(Dispatchers.Main) {
-                        stopVideoPlayback()
-                        currentPlaylistItems = emptyList()
-                        currentItemIndex = 0
-                        try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok")) } catch (_: Exception) {}
+                    try {
+                        // 1) Clear our media cache first
+                        try { storageManager.clearCache() } catch (_: Exception) {}
+
+                        // 2) Clear Glide disk cache BEFORE touching cacheDir so it has a valid directory
+                        try { Glide.get(applicationContext).clearDiskCache() } catch (_: Exception) {}
+
+                        // 3) Clear other app cache files, but keep Glide's folder to avoid races
+                        try {
+                            val dir = cacheDir
+                            dir.listFiles()?.forEach { f ->
+                                if (f.name == "image_manager_disk_cache") return@forEach
+                                try { if (f.isDirectory) f.deleteRecursively() else f.delete() } catch (_: Exception) {}
+                            }
+                        } catch (_: Exception) {}
+
+                        withContext(Dispatchers.Main) {
+                            // 4) Clear Glide memory cache on main thread
+                            try { Glide.get(applicationContext).clearMemory() } catch (_: Exception) {}
+                            stopVideoPlayback()
+                            currentPlaylistItems = emptyList()
+                            currentItemIndex = 0
+                            try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok")) } catch (_: Exception) {}
+                        }
+                    } finally {
+                        isClearingCache = false
                     }
                 }
             }
             "set_volume" -> {
                 try {
-                    val level = (params["level"] as? Number)?.toInt() ?: 50
                     val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                    val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                    val vol = (level * max / 100).coerceIn(0, max)
-                    am.setStreamVolume(AudioManager.STREAM_MUSIC, vol, 0)
-                    wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok", "data" to mapOf("level" to level)))
+                    val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                    // Accept level in 0..100 (preferred) or 0..1.0
+                    val raw = (params["level"] ?: params["volume"]) ?: 50
+                    val pct = when (raw) {
+                        is Number -> raw.toFloat()
+                        is String -> raw.toFloatOrNull() ?: 50f
+                        else -> 50f
+                    }
+                    val perc = if (pct <= 1f) (pct * 100f) else pct
+                    val target = (perc.coerceIn(0f, 100f) / 100f * max).toInt().coerceIn(0, max)
+                    am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
+                    // Also set ExoPlayer volume immediately (0..1)
+                    val exoVol = target.toFloat() / max.toFloat()
+                    exoPlayer?.volume = exoVol
+                    try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok", "level" to (perc.coerceIn(0f,100f).toInt()))) } catch (_: Exception) {}
                 } catch (e: Exception) {
-                    try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "error", "error" to e.message)) } catch (_: Exception) {}
+                    try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "error", "error" to (e.message ?: "error"))) } catch (_: Exception) {}
                 }
             }
-            
-            "next_item" -> {
-                runOnUiThread { advanceToNextItem() }
-                try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok")) } catch (_: Exception) {}
-            }
-            "set_rotation" -> {
-                val deg = (params["degrees"] as? Number)?.toInt() ?: 0
-                runOnUiThread { applyContentRotation(deg) }
-                try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok")) } catch (_: Exception) {}
+            "clear_app_data" -> {
+                // Requires the app to be Device Owner or Profile Owner
+                try {
+                    val dpm = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+                    val isDo = dpm.isDeviceOwnerApp(packageName)
+                    val isPo = try { dpm.isProfileOwnerApp(packageName) } catch (_: Exception) { false }
+                    if (isDo || isPo) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            dpm.clearApplicationUserData(
+                                adminComponent(),
+                                packageName,
+                                mainExecutor,
+                                object : DevicePolicyManager.OnClearApplicationUserDataListener {
+                                    override fun onApplicationUserDataCleared(pkg: String, succeeded: Boolean) {
+                                        try {
+                                            wsManager?.sendJson(
+                                                "command_result",
+                                                mapOf("id" to id, "status" to if (succeeded) "ok" else "error", "error" to if (succeeded) null else "failed")
+                                            )
+                                        } catch (_: Exception) {}
+                                    }
+                                }
+                            )
+                        } else {
+                            // API < 30: the old 3-arg method exists at runtime but was removed from the current SDK; call via reflection
+                            try {
+                                val method = DevicePolicyManager::class.java.getMethod(
+                                    "clearApplicationUserData",
+                                    ComponentName::class.java,
+                                    String::class.java,
+                                    Boolean::class.javaPrimitiveType
+                                )
+                                val result = method.invoke(dpm, adminComponent(), packageName, false) as? Boolean ?: false
+                                try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to if (result) "ok" else "error")) } catch (_: Exception) {}
+                            } catch (e: Exception) {
+                                try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "error", "error" to (e.message ?: "error"))) } catch (_: Exception) {}
+                            }
+                        }
+                    } else {
+                        wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "error", "error" to "not_owner"))
+                    }
+                } catch (e: Exception) {
+                    try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "error", "error" to (e.message ?: "error"))) } catch (_: Exception) {}
+                }
             }
             "restart_app" -> {
                 // Ack first, then schedule a safe restart
@@ -1448,26 +1533,114 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Fetch latest playlist/rotation via heartbeat and apply instantly
+    private fun fetchAndApplyLatestPlaylist(commandId: String? = null) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val deviceInfo = DeviceInfo(
+                    model = "${Build.MANUFACTURER} ${Build.MODEL}",
+                    androidVersion = Build.VERSION.RELEASE ?: Build.VERSION.SDK_INT.toString(),
+                    appVersion = getAppVersion(),
+                    display = collectDisplayInfo(),
+                    videoSupport = collectVideoSupport(),
+                    storage = collectStorageInfo(),
+                    memory = collectMemoryInfo(),
+                    battery = collectBatteryInfo(),
+                    network = collectNetworkInfo(),
+                    localeTime = collectLocaleTimeInfo(),
+                    playerStats = collectPlayerStats()
+                )
+                val resp = ApiClient.apiService.deviceHeartbeat(HeartbeatRequest(deviceId, "", deviceInfo))
+                if (resp.isSuccessful) {
+                    val hb = resp.body()
+                    when (hb?.status) {
+                        "playing" -> {
+                            val pl = hb.playlist
+                            if (pl != null) {
+                                withContext(Dispatchers.Main) {
+                                    applyPlaylistOrientation(pl.orientation)
+                                    applyContentRotation(hb.rotation ?: 0)
+                                    downloadAndPlayPlaylist(pl, force = true)
+                                }
+                                try { wsManager?.sendJson("command_result", mapOf("id" to commandId, "status" to "ok")) } catch (_: Exception) {}
+                            } else {
+                                withContext(Dispatchers.Main) { showPairedScreen() }
+                                try { wsManager?.sendJson("command_result", mapOf("id" to commandId, "status" to "error", "error" to "no_playlist")) } catch (_: Exception) {}
+                            }
+                        }
+                        "paired_waiting" -> {
+                            withContext(Dispatchers.Main) { showPairedScreen() }
+                            try { wsManager?.sendJson("command_result", mapOf("id" to commandId, "status" to "ok", "note" to "waiting")) } catch (_: Exception) {}
+                        }
+                        else -> {
+                            // unpaired or error
+                            withContext(Dispatchers.Main) { showPairedScreen() }
+                            try { wsManager?.sendJson("command_result", mapOf("id" to commandId, "status" to "ok", "note" to (hb?.status ?: "unknown"))) } catch (_: Exception) {}
+                        }
+                    }
+                } else {
+                    // Fallback to local snapshot if heartbeat failed
+                    val pl = lastRemotePlaylist
+                    if (pl != null) {
+                        withContext(Dispatchers.Main) { downloadAndPlayPlaylist(pl, force = true) }
+                        try { wsManager?.sendJson("command_result", mapOf("id" to commandId, "status" to "ok", "note" to "fallback_last_snapshot")) } catch (_: Exception) {}
+                    } else {
+                        try { wsManager?.sendJson("command_result", mapOf("id" to commandId, "status" to "error", "error" to "heartbeat_failed")) } catch (_: Exception) {}
+                    }
+                }
+            } catch (e: Exception) {
+                // Network/other error → fallback
+                val pl = lastRemotePlaylist
+                if (pl != null) {
+                    withContext(Dispatchers.Main) { downloadAndPlayPlaylist(pl, force = true) }
+                    try { wsManager?.sendJson("command_result", mapOf("id" to commandId, "status" to "ok", "note" to "fallback_last_snapshot")) } catch (_: Exception) {}
+                } else {
+                    try { wsManager?.sendJson("command_result", mapOf("id" to commandId, "status" to "error", "error" to (e.message ?: "error"))) } catch (_: Exception) {}
+                }
+            }
+        }
+    }
+
     private fun scheduleAppRestart(delayMs: Long = 500) {
+        // If this Activity is running, we are in foreground. Restart synchronously to avoid BAL blocks.
         try {
-            val ctx = applicationContext
             val intent = packageManager?.getLaunchIntentForPackage(packageName)
             if (intent != null) {
-                intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NEW_TASK)
-                val pi = PendingIntent.getActivity(
-                    ctx,
-                    0,
-                    intent,
-                    PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                intent.addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP
                 )
-                val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-                am.set(AlarmManager.RTC, System.currentTimeMillis() + delayMs, pi)
+                // Delay slightly to allow command_result to flush
+                handler.postDelayed({
+                    try {
+                        startActivity(intent)
+                        overridePendingTransition(0, 0)
+                        finishAffinity()
+                    } catch (_: Exception) { }
+                }, delayMs)
+                return
             }
         } catch (_: Exception) { }
-        // Try to close gracefully
+
+        // Fallback (rare): if we cannot get launch intent, keep old AlarmManager approach but use setAlarmClock
+        try {
+            val ctx = applicationContext
+            val launch = packageManager?.getLaunchIntentForPackage(packageName) ?: return
+            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            val pi = PendingIntent.getActivity(
+                ctx,
+                0,
+                launch,
+                PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            val info = AlarmManager.AlarmClockInfo(System.currentTimeMillis() + delayMs, pi)
+            am.setAlarmClock(info, pi)
+        } catch (_: Exception) { }
+
+        // Gracefully finish current process
         try { exoPlayer?.release() } catch (_: Exception) {}
         try { finishAndRemoveTask() } catch (_: Exception) { finishAffinity() }
-        try { android.os.Process.killProcess(android.os.Process.myPid()) } catch (_: Exception) {}
-        try { System.exit(0) } catch (_: Exception) {}
     }
 }
