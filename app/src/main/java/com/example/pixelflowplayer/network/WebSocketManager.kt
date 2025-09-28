@@ -38,6 +38,9 @@ class WebSocketManager(private val baseHost: String, private val port: Int, priv
     fun connect() {
         shouldReconnect = true
         try {
+            // Close any existing socket to avoid duplicate connections
+            try { ws?.close(1000, "reconnecting") } catch (_: Exception) {}
+            ws = null
             val url = "ws://$baseHost:$port/ws?role=device&deviceId=$deviceId"
             val req = Request.Builder().url(url).build()
             ws = client.newWebSocket(req, object : WebSocketListener() {
@@ -57,7 +60,7 @@ class WebSocketManager(private val baseHost: String, private val port: Int, priv
                                 val id = obj.optString("id", "")
                                 if (id.isNotEmpty()) {
                                     synchronized(pending) { pending.removeAll { it.id == id } }
-                                    Log.d(TAG, "Ack received for id=$id")
+                                    // Suppress ack log to avoid noise
                                 }
                             }
                             "command" -> {
@@ -73,6 +76,15 @@ class WebSocketManager(private val baseHost: String, private val port: Int, priv
                                     }
                                 }
                                 try { sendJson("ack", mapOf("of" to "command", "id" to id)) } catch (_: Exception) {}
+                                // Log a single friendly line per command; downgrade noisy ones
+                                if (cmd == "request_now_playing") {
+                                    Log.d(TAG, "Command received: $cmd (id=$id)")
+                                } else if (cmd == "set_volume") {
+                                    val lvl = params["level"] ?: params["volume"]
+                                    Log.i(TAG, "Command received: set_volume level=${lvl}")
+                                } else {
+                                    Log.i(TAG, "Command received: $cmd (id=$id)")
+                                }
                                 commandHandler?.invoke(id, cmd, params)
                             }
                         }
@@ -85,15 +97,18 @@ class WebSocketManager(private val baseHost: String, private val port: Int, priv
                 }
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: okhttp3.Response?) {
                     Log.e(TAG, "WS failure: ${t.message}")
+                    ws = null
                     scheduleReconnect()
                 }
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                     Log.d(TAG, "WS closed: $code $reason")
+                    ws = null
                     scheduleReconnect()
                 }
             })
         } catch (e: Exception) {
             Log.e(TAG, "connect error", e)
+            ws = null
             scheduleReconnect()
         }
     }

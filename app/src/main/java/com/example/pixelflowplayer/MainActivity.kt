@@ -30,6 +30,8 @@ import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.view.LayoutInflater
+import android.view.ViewGroup
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
@@ -115,6 +117,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var downloadProgressPercentageText: TextView
     private lateinit var downloadItemsCountText: TextView
     private lateinit var downloadErrorDetailsText: TextView
+    // New: per-item list container and row map
+    private lateinit var downloadItemsContainer: LinearLayout
+    private data class RowRefs(val root: View, val name: TextView, val status: TextView, val percent: TextView)
+    private val downloadRowMap = mutableMapOf<String, RowRefs>()
+    private val failedUrls = mutableSetOf<String>()
 
     // --- PlayerManager Integration (keeping modern approach) ---
     private lateinit var playerView: PlayerView
@@ -213,6 +220,14 @@ class MainActivity : AppCompatActivity() {
             val port = if (uri.port > 0) uri.port else 3000
             wsManager = WebSocketManager(host, port, deviceId)
             wsManager?.connect()
+            // Wire remote command handling
+            wsManager?.setCommandHandler { cmdId, command, params ->
+                try {
+                    handleRemoteCommand(cmdId, command, params)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to handle command $command", e)
+                }
+            }
             val registerInfo = mapOf(
                 "deviceId" to deviceId,
                 "deviceInfo" to mapOf(
@@ -226,10 +241,10 @@ class MainActivity : AppCompatActivity() {
             wsManager?.setRegisterPayload(registerInfo)
             wsManager?.sendJson("register", registerInfo)
 
-            // NEW: command handler
-            wsManager?.setCommandHandler { id, command, params ->
-                handleRemoteCommand(id, command, params)
-            }
+            // NEW: force early content refresh shortly after (avoid waiting full heartbeat)
+            Handler(Looper.getMainLooper()).postDelayed({
+                try { fetchAndApplyLatestPlaylist(null) } catch (_: Exception) {}
+            }, 1500)
         } catch (_: Exception) {}
 
         // Initialize views (restored from old file)
@@ -291,6 +306,8 @@ class MainActivity : AppCompatActivity() {
         downloadProgressPercentageText = findViewById(R.id.download_progress_percentage_text)
         downloadItemsCountText = findViewById(R.id.download_items_count_text)
         downloadErrorDetailsText = findViewById(R.id.download_error_details_text)
+        // New list container
+        downloadItemsContainer = findViewById(R.id.download_items_container)
     }
 
     private fun setupNetworkMonitoring() {
@@ -548,6 +565,13 @@ class MainActivity : AppCompatActivity() {
                                         } else if (currentPlaylistItems.isEmpty() && hasPlayable) {
                                             withContext(Dispatchers.Main) { startPlayback(playable!!) }
                                         }
+                                        // Background retry for any failed items still missing
+                                        try {
+                                            val allUrls = newPlaylistFromServer.items.map { item ->
+                                                if (item.url.startsWith("http")) item.url else "$BASE_URL${item.url}"
+                                            }.toSet()
+                                            retryFailedInBackground(allUrls)
+                                        } catch (_: Exception) {}
                                     }
                                 } else if (heartbeatResponse.playlist == null) {
                                     // Playlist was removed on server, stop playback
@@ -656,6 +680,60 @@ class MainActivity : AppCompatActivity() {
         return Playlist(items = mapped, orientation = source.orientation, transitionType = source.transitionType)
     }
 
+    private fun friendlyNameFromUrl(url: String, playlist: Playlist?): String {
+        return try {
+            val last = url.substringAfterLast('/')
+            val win = last.substringAfterLast('\\')
+            val cleaned = win.substringBefore('?').substringBefore('#')
+            val name = playlist?.items?.firstOrNull { it.url.substringAfterLast('/').substringAfterLast('\\').endsWith(cleaned, true) }?.displayName
+            name ?: cleaned
+        } catch (_: Exception) { url.substringAfterLast('/') }
+    }
+
+    private fun buildDownloadRows(urls: Set<String>, playlist: Playlist?) {
+        runOnUiThread {
+            downloadRowMap.clear()
+            downloadItemsContainer.removeAllViews()
+            val inflater = LayoutInflater.from(this)
+            urls.forEach { url ->
+                val row = inflater.inflate(R.layout.item_download_row, downloadItemsContainer, false)
+                val name = row.findViewById<TextView>(R.id.text_name)
+                val status = row.findViewById<TextView>(R.id.text_status)
+                val percent = row.findViewById<TextView>(R.id.text_percent)
+                name.text = friendlyNameFromUrl(url, playlist)
+                status.text = "queued"
+                percent.text = "0%"
+                downloadItemsContainer.addView(row)
+                downloadRowMap[url] = RowRefs(row, name, status, percent)
+            }
+        }
+    }
+
+    private fun markRowInProgress(url: String, progress: Float) {
+        val refs = downloadRowMap[url] ?: return
+        runOnUiThread {
+            refs.status.text = "downloading"
+            refs.status.setTextColor(resources.getColor(android.R.color.white))
+            refs.percent.text = "${progress.toInt()}%"
+        }
+    }
+    private fun markRowDone(url: String) {
+        val refs = downloadRowMap[url] ?: return
+        runOnUiThread {
+            refs.status.text = "done"
+            refs.status.setTextColor(resources.getColor(android.R.color.holo_green_light))
+            refs.percent.text = "100%"
+        }
+    }
+    private fun markRowFailed(url: String, message: String?) {
+        val refs = downloadRowMap[url] ?: return
+        runOnUiThread {
+            refs.status.text = "failed"
+            refs.status.setTextColor(resources.getColor(R.color.dark_red_error))
+            if (refs.percent.text.toString() == "0%") refs.percent.text = "—"
+        }
+    }
+
     /**
      * 📥 Download all playlist items first, then start playback (enhanced for Playlist object)
      */
@@ -696,7 +774,6 @@ class MainActivity : AppCompatActivity() {
                 }.toSet()
             }
 
-            // If nothing is missing, do not show the blocking download UI. Just rebuild and play.
             if (missingUrls.isEmpty()) {
                 Log.d(TAG, "No downloads needed; applying metadata changes and starting playback immediately.")
                 storageManager.cleanupCacheExcept(allTargetUrls)
@@ -712,11 +789,12 @@ class MainActivity : AppCompatActivity() {
             }
 
             withContext(Dispatchers.Main) {
-                // Show blocking overlay only when we really need to download files
                 isBlockingOnDownload = true
                 stopVideoPlayback()
                 playerContainer.visibility = View.GONE
                 showDownloadOverlay(allTargetUrls.size)
+                // Build rows for missing items
+                buildDownloadRows(missingUrls, newPlaylist)
 
                 saveLocalPlaylist(newPlaylist)
                 playbackStartedFromDownloads = false
@@ -790,6 +868,23 @@ class MainActivity : AppCompatActivity() {
                     }
                     val failedCount = urlsToTrack.count { url -> progressMap[url] is DownloadProgress.Failed }
 
+                    // Update per-item rows
+                    urlsToTrack.forEach { url ->
+                        when (val p = progressMap[url]) {
+                            is DownloadProgress.InProgress -> {
+                                markRowInProgress(url, p.progressPercent)
+                            }
+                            is DownloadProgress.Completed -> {
+                                markRowDone(url)
+                            }
+                            is DownloadProgress.Failed -> {
+                                failedUrls.add(url)
+                                markRowFailed(url, p.error)
+                            }
+                            else -> { /* queued or null -> leave as is */ }
+                        }
+                    }
+
                     val percent = if (urlsToTrack.isNotEmpty()) (completedCount * 100) / urlsToTrack.size else 100
                     val inProgUrl = progressMap.entries.firstOrNull { it.value is DownloadProgress.InProgress }?.key
                     val fileBase = inProgUrl?.substringAfterLast('/')?.substringAfterLast('\\') ?: ""
@@ -801,7 +896,7 @@ class MainActivity : AppCompatActivity() {
                         match?.displayName ?: cleaned
                     } catch (_: Exception) { cleaned }
 
-                    // Emit realtime progress to CMS (keep filename for mapping there)
+                    // Emit realtime progress to CMS
                     try {
                         wsManager?.sendJson("download_progress", mapOf(
                             "completed" to completedCount,
@@ -813,11 +908,11 @@ class MainActivity : AppCompatActivity() {
                     } catch (_: Exception) {}
 
                     withContext(Dispatchers.Main) {
-                        updateDownloadOverlay(completedCount, urlsToTrack.size, percent, currentNameFriendly, errors)
+                        updateDownloadOverlay(completedCount, urlsToTrack.size, percent, currentNameFriendly, emptyList())
                     }
 
                     if (completedCount + failedCount >= urlsToTrack.size) {
-                        // All done: small delay to flush writes, then hand off to playback
+                        // All done
                         delay(350)
                         val freshPlaylist = (lastRemotePlaylist ?: getLocalPlaylist())?.let { buildLocalPlaylistFromCache(it) }
                         withContext(Dispatchers.Main) {
@@ -826,12 +921,10 @@ class MainActivity : AppCompatActivity() {
                             if (freshPlaylist != null && freshPlaylist.items.isNotEmpty()) startPlayback(freshPlaylist) else showPairedScreen(instructions = getString(R.string.status_no_items_to_play))
                         }
                         playlistUpdateInProgress = false
-                        // Cancel this monitor gracefully
                         cancel()
                     }
                 }
             } catch (_: CancellationException) {
-                // normal lifecycle: monitor replaced or UI closed
             } catch (e: Exception) {
                 Log.e(TAG, "Download monitor error", e)
             }
@@ -1414,12 +1507,14 @@ class MainActivity : AppCompatActivity() {
     private fun handleRemoteCommand(id: String, command: String, params: Map<String, Any?>) {
         when (command) {
             "force_update", "reload_playlist" -> {
+                Log.i(TAG, "CMS command: FORCE UPDATE")
                 runOnUiThread {
                     // Immediately fetch latest state from server, then apply
                     fetchAndApplyLatestPlaylist(id)
                 }
             }
             "clear_cache" -> {
+                Log.i(TAG, "CMS command: CLEAR CACHE")
                 if (isClearingCache) {
                     try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok", "note" to "already_clearing")) } catch (_: Exception) {}
                     return
@@ -1449,6 +1544,8 @@ class MainActivity : AppCompatActivity() {
                             currentPlaylistItems = emptyList()
                             currentItemIndex = 0
                             try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok")) } catch (_: Exception) {}
+                            // Immediately fetch latest content so playback can resume without waiting for heartbeat
+                            try { fetchAndApplyLatestPlaylist(null) } catch (_: Exception) {}
                         }
                     } finally {
                         isClearingCache = false
@@ -1456,23 +1553,48 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             "set_volume" -> {
+                val raw = (params["level"] ?: params["volume"]) ?: 50
+                val pct = when (raw) {
+                    is Number -> raw.toFloat()
+                    is String -> raw.toFloatOrNull() ?: 50f
+                    else -> 50f
+                }
+                val perc = if (pct <= 1f) (pct * 100f) else pct
+                Log.i(TAG, "CMS command: SET VOLUME to ${perc.coerceIn(0f,100f).toInt()}%")
                 try {
                     val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
                     val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
-                    // Accept level in 0..100 (preferred) or 0..1.0
-                    val raw = (params["level"] ?: params["volume"]) ?: 50
-                    val pct = when (raw) {
-                        is Number -> raw.toFloat()
-                        is String -> raw.toFloatOrNull() ?: 50f
-                        else -> 50f
-                    }
-                    val perc = if (pct <= 1f) (pct * 100f) else pct
                     val target = (perc.coerceIn(0f, 100f) / 100f * max).toInt().coerceIn(0, max)
                     am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
                     // Also set ExoPlayer volume immediately (0..1)
                     val exoVol = target.toFloat() / max.toFloat()
                     exoPlayer?.volume = exoVol
                     try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok", "level" to (perc.coerceIn(0f,100f).toInt()))) } catch (_: Exception) {}
+                } catch (e: Exception) {
+                    try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "error", "error" to (e.message ?: "error"))) } catch (_: Exception) {}
+                }
+            }
+            "request_now_playing" -> {
+                try {
+                    val idx = currentItemIndex
+                    val item = currentPlaylistItems.getOrNull(idx)
+                    if (item != null) {
+                        val isVideo = item.type.equals("video", ignoreCase = true)
+                        val posMs = if (isVideo) (exoPlayer?.currentPosition ?: 0L) else 0L
+                        val durMs = if (isVideo) (exoPlayer?.duration ?: (item.duration * 1000L)) else (item.duration * 1000L)
+                        wsManager?.sendJson("now_playing_update", mapOf(
+                            "index" to idx,
+                            "mediaType" to item.type,
+                            "url" to item.url,
+                            "displayMode" to (item.displayMode ?: "contain"),
+                            "rotation" to contentRotation,
+                            "duration" to item.duration,
+                            "positionMs" to posMs,
+                            "durationMs" to durMs,
+                            "sentAt" to System.currentTimeMillis()
+                        ))
+                    }
+                    try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok")) } catch (_: Exception) {}
                 } catch (e: Exception) {
                     try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "error", "error" to (e.message ?: "error"))) } catch (_: Exception) {}
                 }
@@ -1523,6 +1645,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             "restart_app" -> {
+                Log.i(TAG, "CMS command: RESTART APP")
                 // Ack first, then schedule a safe restart
                 try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "ok")) } catch (_: Exception) {}
                 runOnUiThread { scheduleAppRestart(600) }
@@ -1531,6 +1654,12 @@ class MainActivity : AppCompatActivity() {
                 try { wsManager?.sendJson("command_result", mapOf("id" to id, "status" to "error", "error" to "unsupported_command")) } catch (_: Exception) {}
             }
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try { wsManager?.disconnect() } catch (_: Exception) {}
+        wsManager = null
     }
 
     // Fetch latest playlist/rotation via heartbeat and apply instantly
@@ -1601,6 +1730,27 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Retry previously failed downloads in the background without blocking UI
+    private fun retryFailedInBackground(allTargetUrls: Set<String>) {
+        if (failedUrls.isEmpty()) return
+        CoroutineScope(Dispatchers.IO).launch {
+            failedUrls.toList().forEach { url ->
+                try {
+                    // Only retry items that are part of the current playlist and still missing
+                    if (url !in allTargetUrls) return@forEach
+                    val f = storageManager.getCacheFile(url)
+                    if (f.exists() && f.length() > 0) {
+                        failedUrls.remove(url)
+                        return@forEach
+                    }
+                    downloadManager.queueDownload(
+                        DownloadRequest(url = url, priority = DownloadPriority.NORMAL)
+                    )
+                } catch (_: Exception) { }
+            }
+        }
+    }
+
     private fun scheduleAppRestart(delayMs: Long = 500) {
         // If this Activity is running, we are in foreground. Restart synchronously to avoid BAL blocks.
         try {
@@ -1629,6 +1779,7 @@ class MainActivity : AppCompatActivity() {
             val launch = packageManager?.getLaunchIntentForPackage(packageName) ?: return
             launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
             val pi = PendingIntent.getActivity(
+
                 ctx,
                 0,
                 launch,
@@ -1636,6 +1787,7 @@ class MainActivity : AppCompatActivity() {
             )
             val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
             val info = AlarmManager.AlarmClockInfo(System.currentTimeMillis() + delayMs, pi)
+
             am.setAlarmClock(info, pi)
         } catch (_: Exception) { }
 
