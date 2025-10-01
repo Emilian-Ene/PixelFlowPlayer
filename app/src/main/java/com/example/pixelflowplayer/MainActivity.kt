@@ -13,7 +13,9 @@ import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
@@ -139,6 +141,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private var exoPlayer: ExoPlayer? = null
     private var imageAdvanceRunnable: Runnable? = null
+    private var nowPlayingUpdateRunnable: Runnable? = null
+    private var currentItemStartedAtMs: Long = 0L
 
     private lateinit var storageManager: StorageManager
     private lateinit var downloadManager: DownloadManager
@@ -185,7 +189,7 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "MainActivity"
         private const val KEY_PENDING_PAIRING_CODE = "pendingPairingCode"
-        private const val BASE_URL = "http://192.168.1.151:3000"
+        const val BASE_URL = "http://192.168.1.151:3000"
     }
 
     // Track once-only skip notifications per filename
@@ -232,7 +236,7 @@ class MainActivity : AppCompatActivity() {
             val host = uri.host ?: "192.168.1.151"
             val port = if (uri.port > 0) uri.port else 3000
             wsManager = WebSocketManager.getInstance(host, port, deviceId)
-            wsManager?.connect()
+            wsManager?.ensureConnected()
             // Wire remote command handling
             wsManager?.setCommandHandler { cmdId, command, params ->
                 try {
@@ -325,6 +329,20 @@ class MainActivity : AppCompatActivity() {
 
     private fun setupNetworkMonitoring() {
         connectivityManager = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+        // NEW: proactively reconnect WS on network changes
+        try {
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            connectivityManager.registerNetworkCallback(request, object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    try { wsManager?.ensureConnected() } catch (_: Exception) {}
+                }
+                override fun onLost(network: Network) {
+                    try { wsManager?.ensureConnected() } catch (_: Exception) {}
+                }
+            })
+        } catch (_: Exception) { }
     }
 
     private fun startPeriodicNetworkCheck() {
@@ -1021,20 +1039,62 @@ class MainActivity : AppCompatActivity() {
 
     private fun showExitConfirmDialog() {
         showTransientControls()
-        AlertDialog.Builder(this)
-            .setMessage(getString(R.string.exit_confirm_message))
-            .setPositiveButton(getString(R.string.action_yes)) { _, _ ->
-                try { stopLockTask() } catch (_: Exception) {}
-                try { exoPlayer?.release() } catch (_: Exception) {}
-                finishAndRemoveTask(); finishAffinity()
-            }
-            .setNegativeButton(getString(R.string.action_no)) { dialog, _ ->
-                dialog.dismiss()
-                showTransientControls()
-            }
-            .setCancelable(true)
-            .show()
-    }
+        val dlg = AlertDialog.Builder(this)
+            // Use a clearer message similar to the provided reference
+            .setMessage("Do you want to exit the player?")
+             .setPositiveButton("EXIT") { _, _ ->
+                 try { stopLockTask() } catch (_: Exception) {}
+                 try { exoPlayer?.release() } catch (_: Exception) {}
+                 finishAndRemoveTask(); finishAffinity()
+             }
+             .setNegativeButton("CANCEL") { dialog, _ ->
+                 dialog.dismiss()
+                 showTransientControls()
+             }
+             .setCancelable(true)
+             .create()
+        dlg.show()
+        // Style buttons like simple text actions aligned right (no colored backgrounds)
+        try {
+            // Dark dialog background
+            dlg.window?.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(android.graphics.Color.parseColor("#424242")))
+            // White message text
+            dlg.findViewById<TextView>(android.R.id.message)?.setTextColor(android.graphics.Color.WHITE)
+            
+             val yes = dlg.getButton(AlertDialog.BUTTON_POSITIVE)
+             val no = dlg.getButton(AlertDialog.BUTTON_NEGATIVE)
+             // Align container to the end (right)
+             (yes.parent as? LinearLayout)?.apply {
+                 gravity = android.view.Gravity.END
+                 // Keep order: CANCEL then EXIT
+             }
+             // Helper to convert dp to px
+             fun Int.dp() = (this * resources.displayMetrics.density).toInt()
+             // Remove solid backgrounds; use text-only actions
+             yes.setBackgroundColor(android.graphics.Color.TRANSPARENT)
+             no.setBackgroundColor(android.graphics.Color.TRANSPARENT)
+             // Subtle colors: EXIT accent, CANCEL default with pressed (hover-like) state
+             val states = arrayOf(
+                intArrayOf(android.R.attr.state_pressed),
+                intArrayOf()
+            )
+            val exitColors = intArrayOf(
+                android.graphics.Color.parseColor("#26C6DA"), // pressed (lighter teal)
+                android.graphics.Color.parseColor("#00BCD4")  // normal teal
+            )
+            val cancelColors = intArrayOf(
+                android.graphics.Color.parseColor("#B0BEC5"), // pressed (lighter gray)
+                android.graphics.Color.parseColor("#9E9E9E")  // normal gray
+            )
+            yes.setTextColor(android.content.res.ColorStateList(states, exitColors))
+            no.setTextColor(android.content.res.ColorStateList(states, cancelColors))
+             yes.isAllCaps = true
+             no.isAllCaps = true
+             // Add a little spacing between them
+             (yes.layoutParams as? LinearLayout.LayoutParams)?.apply { setMargins(12.dp(), 8.dp(), 8.dp(), 8.dp()) }
+             (no.layoutParams as? LinearLayout.LayoutParams)?.apply { setMargins(8.dp(), 8.dp(), 12.dp(), 8.dp()) }
+         } catch (_: Exception) { /* best effort styling */ }
+     }
 
     private fun showPairedScreen(pairingCode: String? = null, instructions: String? = null) {
         pairingView.visibility = View.VISIBLE
@@ -1152,12 +1212,14 @@ class MainActivity : AppCompatActivity() {
             if (lastNowPlayingKey != key) {
                 wsManager?.sendJson("now_playing", mapOf(
                     "index" to currentItemIndex,
-                    // Use mediaType to avoid overriding the event type in WS
                     "mediaType" to item.type,
                     "url" to item.url,
                     "displayMode" to (item.displayMode ?: "contain"),
                     "rotation" to contentRotation,
-                    "duration" to item.duration
+                    // ms-based timing for accurate countdown
+                    "positionMs" to 0,
+                    "durationMs" to (item.duration * 1000),
+                    "sentAt" to System.currentTimeMillis()
                 ))
                 lastNowPlayingKey = key
                 sentReadyUpdateForKey = false
@@ -1208,6 +1270,10 @@ class MainActivity : AppCompatActivity() {
         // Stop any pending image advance
         imageAdvanceRunnable?.let { handler.removeCallbacks(it) }
         imageAdvanceRunnable = null
+        // Stop previous periodic updates
+        nowPlayingUpdateRunnable?.let { handler.removeCallbacks(it) }
+        nowPlayingUpdateRunnable = null
+        currentItemStartedAtMs = SystemClock.uptimeMillis()
 
         if (item.type.equals("video", ignoreCase = true)) {
             // Video via ExoPlayer
@@ -1226,6 +1292,27 @@ class MainActivity : AppCompatActivity() {
                 Log.e(TAG, "Failed to start video playback", e)
                 handler.post { advanceToNextItem() }
             }
+            // Schedule periodic now_playing_update while video plays
+            nowPlayingUpdateRunnable = object : Runnable {
+                override fun run() {
+                    try {
+                        val posMs = exoPlayer?.currentPosition ?: 0L
+                        val durMs = exoPlayer?.duration ?: (item.duration * 1000L)
+                        wsManager?.sendJson("now_playing_update", mapOf(
+                            "index" to currentItemIndex,
+                            "mediaType" to item.type,
+                            "url" to item.url,
+                            "displayMode" to (item.displayMode ?: "contain"),
+                            "rotation" to contentRotation,
+                            "positionMs" to posMs,
+                            "durationMs" to durMs,
+                            "sentAt" to System.currentTimeMillis()
+                        ))
+                    } catch (_: Exception) {}
+                    handler.postDelayed(this, 1500)
+                }
+            }
+            handler.postDelayed(nowPlayingUpdateRunnable!!, 1500)
         } else {
             // Image via Glide
             playerView.visibility = View.GONE
@@ -1243,6 +1330,27 @@ class MainActivity : AppCompatActivity() {
             val seconds = if (item.duration > 0) item.duration else 8
             imageAdvanceRunnable = Runnable { advanceToNextItem() }
             handler.postDelayed(imageAdvanceRunnable!!, seconds * 1000L)
+            // Schedule periodic updates for image using elapsed time
+            nowPlayingUpdateRunnable = object : Runnable {
+                override fun run() {
+                    try {
+                        val elapsed = (SystemClock.uptimeMillis() - currentItemStartedAtMs).coerceAtLeast(0)
+                        val durMs = seconds * 1000L
+                        wsManager?.sendJson("now_playing_update", mapOf(
+                            "index" to currentItemIndex,
+                            "mediaType" to item.type,
+                            "url" to item.url,
+                            "displayMode" to (item.displayMode ?: "contain"),
+                            "rotation" to contentRotation,
+                            "positionMs" to elapsed,
+                            "durationMs" to durMs,
+                            "sentAt" to System.currentTimeMillis()
+                        ))
+                    } catch (_: Exception) {}
+                    handler.postDelayed(this, 1500)
+                }
+            }
+            handler.postDelayed(nowPlayingUpdateRunnable!!, 1500)
         }
     }
 
@@ -1251,8 +1359,14 @@ class MainActivity : AppCompatActivity() {
         isShuttingDown = true
         try { handler.removeCallbacksAndMessages(null) } catch (_: Exception) {}
         try { Glide.with(applicationContext).clear(imagePlayerView) } catch (_: Exception) {}
+        nowPlayingUpdateRunnable?.let { try { handler.removeCallbacks(it) } catch (_: Exception) {} }
         try { wsManager?.disconnect() } catch (_: Exception) {}
         wsManager = null
+    }
+
+    override fun onResume() {
+        super.onResume()
+        try { wsManager?.ensureConnected() } catch (_: Exception) {}
     }
 
     private fun initializePlayer() {
@@ -1281,8 +1395,9 @@ class MainActivity : AppCompatActivity() {
                                         "url" to current.url,
                                         "displayMode" to (current.displayMode ?: "contain"),
                                         "rotation" to contentRotation,
-                                        "duration" to (durMs / 1000).toInt(),
-                                        "id" to key
+                                        "positionMs" to (exoPlayer?.currentPosition ?: 0L),
+                                        "durationMs" to durMs,
+                                        "sentAt" to System.currentTimeMillis()
                                     ))
                                     sentReadyUpdateForKey = true
                                 }
@@ -1316,10 +1431,9 @@ class MainActivity : AppCompatActivity() {
                             Log.w(TAG, "Deleted corrupt cached file: ${f.name}")
                         }
                     } catch (_: Exception) {}
-                    // Silent skip: no toast
+                    // Skip to next item so UI doesn’t hang (no auto re-download)
+                    handler.post { advanceToNextItem() }
                 }
-                // Skip to next item so UI doesn’t hang (no auto re-download)
-                handler.post { advanceToNextItem() }
             }
         })
     }
@@ -1669,6 +1783,8 @@ class MainActivity : AppCompatActivity() {
                             candidate
                         } catch (_: Exception) { null }
 
+                       
+
                         if (bmp == null) throw RuntimeException("screenshot_failed")
 
                         // 2) Downscale to max 1080p on longest edge to save bandwidth
@@ -1676,7 +1792,7 @@ class MainActivity : AppCompatActivity() {
                         val scaled: Bitmap = try {
                             val w = bmp.width
                             val h = bmp.height
-                            val scale = maxOf(w, h).toFloat() / maxEdge.toFloat()
+                                                       val scale = maxOf(w, h).toFloat() / maxEdge.toFloat()
                             if (scale > 1f) {
                                 val nw = (w / scale).toInt().coerceAtLeast(1)
                                 val nh = (h / scale).toInt().coerceAtLeast(1)
@@ -1729,7 +1845,8 @@ class MainActivity : AppCompatActivity() {
                                 object : DevicePolicyManager.OnClearApplicationUserDataListener {
                                     override fun onApplicationUserDataCleared(pkg: String, succeeded: Boolean) {
                                         try {
-                                            wsManager?.sendJson(
+
+                                                                                       wsManager?.sendJson(
                                                 "command_result",
                                                 mapOf("id" to id, "command" to command, "status" to if (succeeded) "ok" else "error", "error" to if (succeeded) null else "failed")
                                             )
@@ -1810,6 +1927,7 @@ class MainActivity : AppCompatActivity() {
                                 }
                                 try { wsManager?.sendJson("command_result", mapOf("id" to commandId, "status" to "ok")) } catch (_: Exception) {}
                             } else {
+                                // No playlist even though status says playing; treat as waiting
                                 withContext(Dispatchers.Main) { showPairedScreen() }
                                 try { wsManager?.sendJson("command_result", mapOf("id" to commandId, "status" to "error", "error" to "no_playlist")) } catch (_: Exception) {}
                             }
@@ -1819,9 +1937,11 @@ class MainActivity : AppCompatActivity() {
                             try { wsManager?.sendJson("command_result", mapOf("id" to commandId, "status" to "ok", "note" to "waiting")) } catch (_: Exception) {}
                         }
                         else -> {
-                            // unpaired or error
-                            withContext(Dispatchers.Main) { showPairedScreen() }
-                            try { wsManager?.sendJson("command_result", mapOf("id" to commandId, "status" to "ok", "note" to (hb?.status ?: "unknown"))) } catch (_: Exception) {}
+                            // unpaired or unknown → explicitly show pairing code, avoid flashing 'Paired'
+                            val code = getOrCreatePendingPairingCode()
+                            getSharedPreferences("PixelFlowPlayerPrefs", MODE_PRIVATE).edit { putBoolean("isPaired", false) }
+                            withContext(Dispatchers.Main) { showPairedScreen(code, getString(R.string.pairing_instructions_unpaired)) }
+                            try { wsManager?.sendJson("command_result", mapOf("id" to commandId, "status" to "ok", "note" to (hb?.status ?: "unpaired"))) } catch (_: Exception) {}
                         }
                     }
                 } else {
@@ -1869,46 +1989,27 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun scheduleAppRestart(delayMs: Long = 500) {
-        // If this Activity is running, we are in foreground. Restart synchronously to avoid BAL blocks.
+        // Always schedule a reliable restart via AlarmManager to avoid losing the restart when handlers are cleared
         try {
-            val intent = packageManager?.getLaunchIntentForPackage(packageName)
-            if (intent != null) {
-                intent.addFlags(
-                    Intent.FLAG_ACTIVITY_NEW_TASK or
-                    Intent.FLAG_ACTIVITY_CLEAR_TASK or
-                    Intent.FLAG_ACTIVITY_CLEAR_TOP
+            val ctx = applicationContext
+            val launch = packageManager?.getLaunchIntentForPackage(packageName)
+            if (launch != null) {
+                launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                val pi = PendingIntent.getActivity(
+                    ctx,
+                    0,
+                    launch,
+                    PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE
                 )
-                // Delay slightly to allow command_result to flush
-                handler.postDelayed({
-                    try {
-                        startActivity(intent)
-                        overridePendingTransition(0, 0)
-                        finishAffinity()
-                    } catch (_: Exception) { }
-                }, delayMs)
-                return
+                val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                val triggerAt = System.currentTimeMillis() + delayMs
+                // Use setAlarmClock for user-visible restart, most reliable across vendors
+                val info = AlarmManager.AlarmClockInfo(triggerAt, pi)
+                am.setAlarmClock(info, pi)
             }
         } catch (_: Exception) { }
 
-        // Fallback (rare): if we cannot get launch intent, keep old AlarmManager approach but use setAlarmClock
-        try {
-            val ctx = applicationContext
-            val launch = packageManager?.getLaunchIntentForPackage(packageName) ?: return
-            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-            val pi = PendingIntent.getActivity(
-
-                ctx,
-                0,
-                launch,
-                PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-            val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            val info = AlarmManager.AlarmClockInfo(System.currentTimeMillis() + delayMs, pi)
-
-            am.setAlarmClock(info, pi)
-        } catch (_: Exception) { }
-
-        // Gracefully finish current process
+        // Finish current task/process so launcher intent restarts from a clean state
         try { exoPlayer?.release() } catch (_: Exception) {}
         try { finishAndRemoveTask() } catch (_: Exception) { finishAffinity() }
     }

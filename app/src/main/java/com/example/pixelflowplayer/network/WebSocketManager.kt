@@ -28,7 +28,11 @@ class WebSocketManager private constructor(val baseHost: String, val port: Int, 
 
     private val TAG = "WebSocketManager"
     private var ws: WebSocket? = null
-    private val client = OkHttpClient.Builder().readTimeout(0, TimeUnit.MILLISECONDS).build()
+    private val client = OkHttpClient.Builder()
+        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .retryOnConnectionFailure(true)
+        .pingInterval(20, TimeUnit.SECONDS)
+        .build()
     private val gson = Gson()
 
     // Reliability
@@ -38,6 +42,38 @@ class WebSocketManager private constructor(val baseHost: String, val port: Int, 
     private var reconnectAttempts = 0
     private var shouldReconnect = true
     private var reconnectRunnable: Runnable? = null
+
+    // Watchdog: reconnect if no activity
+    private var lastActivityMs: Long = System.currentTimeMillis()
+    private var watchdogRunnable: Runnable? = null
+    private var watchdogTimeoutMs: Long = 60_000L
+    private var watchdogIntervalMs: Long = 30_000L
+
+    fun configureWatchdog(timeoutMs: Long = 60_000L, intervalMs: Long = 30_000L) {
+        watchdogTimeoutMs = timeoutMs
+        watchdogIntervalMs = intervalMs
+    }
+
+    private fun startWatchdog() {
+        stopWatchdog()
+        watchdogRunnable = object : Runnable {
+            override fun run() {
+                val idle = System.currentTimeMillis() - lastActivityMs
+                if (idle > watchdogTimeoutMs) {
+                    Log.w(TAG, "Watchdog: no WS activity for ${idle}ms, forcing reconnect()")
+                    try { connect() } catch (_: Exception) {}
+                    lastActivityMs = System.currentTimeMillis()
+                }
+                handler.postDelayed(this, watchdogIntervalMs)
+            }
+        }
+        handler.postDelayed(watchdogRunnable!!, watchdogIntervalMs)
+        Log.d(TAG, "Watchdog started (timeout=${watchdogTimeoutMs} interval=${watchdogIntervalMs})")
+    }
+    private fun stopWatchdog() {
+        watchdogRunnable?.let { handler.removeCallbacks(it) }
+        watchdogRunnable = null
+    }
 
     // Deduplicate commands by id (bounded memory)
     private val handledIds = LinkedHashSet<String>()
@@ -60,7 +96,22 @@ class WebSocketManager private constructor(val baseHost: String, val port: Int, 
 
     // command handler callback (single listener)
     private var commandHandler: ((id: String, command: String, params: Map<String, Any?>) -> Unit)? = null
-    fun setCommandHandler(handlerFn: (id: String, command: String, params: Map<String, Any?>) -> Unit) { commandHandler = handlerFn }
+    private val pendingIncoming = mutableListOf<Triple<String, String, Map<String, Any?>>>()
+    fun setCommandHandler(handlerFn: (id: String, command: String, params: Map<String, Any?>) -> Unit) {
+        commandHandler = handlerFn
+        // Flush any queued commands that arrived before the handler was set
+        val toDeliver: List<Triple<String, String, Map<String, Any?>>> = synchronized(pendingIncoming) {
+            val copy = pendingIncoming.toList()
+            pendingIncoming.clear()
+            copy
+        }
+        if (toDeliver.isNotEmpty()) {
+            Log.i(TAG, "Delivering ${toDeliver.size} queued command(s) after handler set")
+            for ((id, cmd, params) in toDeliver) {
+                try { commandHandler?.invoke(id, cmd, params) } catch (e: Exception) { Log.e(TAG, "Handler error", e) }
+            }
+        }
+    }
 
     fun connect() {
         shouldReconnect = true
@@ -73,13 +124,16 @@ class WebSocketManager private constructor(val baseHost: String, val port: Int, 
             ws = client.newWebSocket(req, object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: okhttp3.Response) {
                     Log.d(TAG, "WS connected")
+                    lastActivityMs = System.currentTimeMillis()
                     reconnectAttempts = 0
                     // Send queued messages first-in-first-out
                     // Also send register on open if provided
                     registerPayload?.let { sendJson("register", it) }
                     flushQueue()
+                    startWatchdog()
                 }
                 override fun onMessage(webSocket: WebSocket, text: String) {
+                    lastActivityMs = System.currentTimeMillis()
                     try {
                         val obj = JSONObject(text)
                         when (obj.optString("type")) {
@@ -98,34 +152,32 @@ class WebSocketManager private constructor(val baseHost: String, val port: Int, 
                                     val it = p.keys(); while (it.hasNext()) { val k = it.next(); params[k] = p.get(k) }
                                 }
                                 try { sendJson("ack", mapOf("of" to "command", "id" to id)) } catch (_: Exception) {}
-                                // Log a single friendly line per command; downgrade noisy ones
-                                if (cmd == "request_now_playing") {
-                                    Log.d(TAG, "Command received: $cmd (id=$id)")
-                                } else if (cmd == "set_volume") {
-                                    val lvl = params["level"] ?: params["volume"]
-                                    Log.i(TAG, "Command received: set_volume level=${lvl}")
+                                val h = commandHandler
+                                if (h != null) {
+                                    try { h.invoke(id, cmd, params) } catch (e: Exception) { Log.e(TAG, "Handler error", e) }
                                 } else {
-                                    Log.i(TAG, "Command received: $cmd (id=$id)")
+                                    // Queue until the Activity sets a handler
+                                    synchronized(pendingIncoming) { pendingIncoming.add(Triple(id, cmd, params)) }
+                                    Log.i(TAG, "Queued command id=$id cmd=$cmd (no handler yet)")
                                 }
-                                commandHandler?.invoke(id, cmd, params)
                             }
                         }
                     } catch (e: Exception) {
                         Log.d(TAG, "WS message: $text")
                     }
                 }
-                override fun onMessage(webSocket: WebSocket, bytes: ByteString) { Log.d(TAG, "WS binary message ${bytes.size}") }
-                override fun onFailure(webSocket: WebSocket, t: Throwable, response: okhttp3.Response?) { Log.e(TAG, "WS failure: ${t.message}"); ws = null; scheduleReconnect() }
-                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { Log.d(TAG, "WS closed: $code $reason"); ws = null; scheduleReconnect() }
+                override fun onMessage(webSocket: WebSocket, bytes: ByteString) { lastActivityMs = System.currentTimeMillis(); Log.d(TAG, "WS binary message ${bytes.size}") }
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: okhttp3.Response?) { Log.e(TAG, "WS failure: ${t.message}"); ws = null; stopWatchdog(); scheduleReconnect() }
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { Log.d(TAG, "WS closed: $code $reason"); ws = null; stopWatchdog(); scheduleReconnect() }
             })
         } catch (e: Exception) {
-            Log.e(TAG, "connect error", e); ws = null; scheduleReconnect()
+            Log.e(TAG, "connect error", e); ws = null; stopWatchdog(); scheduleReconnect()
         }
     }
 
     private fun scheduleReconnect() {
         if (!shouldReconnect) return
-        val delay = (1000L shl reconnectAttempts).coerceAtMost(30_000L)
+        val delay = (1000L shl reconnectAttempts).coerceAtMost(15_000L)
         reconnectAttempts = (reconnectAttempts + 1).coerceAtMost(5)
         reconnectRunnable?.let { handler.removeCallbacks(it) }
         reconnectRunnable = Runnable { connect() }
@@ -138,6 +190,7 @@ class WebSocketManager private constructor(val baseHost: String, val port: Int, 
         try { ws?.close(1000, "bye") } catch (_: Exception) {}
         reconnectRunnable?.let { handler.removeCallbacks(it) }
         reconnectRunnable = null
+        stopWatchdog()
     }
 
     private fun isOpen(): Boolean = try { ws != null && ws!!.send("") } catch (_: Exception) { false }
@@ -147,6 +200,9 @@ class WebSocketManager private constructor(val baseHost: String, val port: Int, 
         copy.forEach { p -> try { ws?.send(p.json) } catch (_: Exception) {} }
     }
 
+    // Allow callers to ensure a connection exists; if not, reconnect immediately
+    fun ensureConnected() { if (!isOpen()) connect() }
+
     fun sendJson(type: String, payload: Map<String, Any?> = emptyMap()) {
         val id = UUID.randomUUID().toString()
         val body = HashMap<String, Any?>(); body["type"] = type; body["id"] = id
@@ -154,6 +210,7 @@ class WebSocketManager private constructor(val baseHost: String, val port: Int, 
         for ((k, v) in payload) if (k != "type" && k != "id") body[k] = v
         val json = gson.toJson(body)
         synchronized(pending) { pending.add(Pending(id, json)); if (pending.size > 200) pending.removeAt(0) }
+        lastActivityMs = System.currentTimeMillis()
         try { ws?.send(json) ?: run { scheduleReconnect() } } catch (_: Exception) { scheduleReconnect() }
     }
 }
