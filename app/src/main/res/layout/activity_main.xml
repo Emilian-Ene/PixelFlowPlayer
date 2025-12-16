@@ -98,6 +98,15 @@
             android:background="@android:color/black"
             android:scaleType="centerCrop"
             android:contentDescription="@string/image_player_description" />
+
+        <!-- NEW: Snapshot view for transitions -->
+        <ImageView
+            android:id="@+id/transition_snapshot_view"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="@android:color/black"
+            android:scaleType="centerCrop"
+            android:visibility="gone" />
     </FrameLayout>
 
     <!-- Offline Indicator -->

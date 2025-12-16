@@ -53,6 +53,11 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.bumptech.glide.Glide
+import com.bumptech.glide.request.RequestListener
+import com.bumptech.glide.load.engine.GlideException
+import com.bumptech.glide.request.target.Target
+import android.graphics.drawable.Drawable
+import com.bumptech.glide.load.DataSource
 import com.example.pixelflowplayer.download.DownloadManager
 import com.example.pixelflowplayer.download.DownloadPriority
 import com.example.pixelflowplayer.download.DownloadProgress
@@ -99,6 +104,7 @@ import android.media.AudioManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.view.TextureView
+import android.net.Uri
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import okhttp3.OkHttpClient
@@ -122,6 +128,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var playerContainer: FrameLayout
     private lateinit var offlineIndicator: ImageView
 
+    // NEW: Snapshot view for transitions
+    private lateinit var transitionSnapshotView: ImageView
+
     // --- Download Progress Views (restored from old file) ---
     private lateinit var downloadProgressView: LinearLayout
     private lateinit var downloadMainStatusText: TextView
@@ -144,26 +153,32 @@ class MainActivity : AppCompatActivity() {
     private var nowPlayingUpdateRunnable: Runnable? = null
     private var currentItemStartedAtMs: Long = 0L
 
+    // Managers and services (restored)
     private lateinit var storageManager: StorageManager
     private lateinit var downloadManager: DownloadManager
     private lateinit var networkManager: NetworkManager
-
-    // --- Device Management (restored from old file) ---
-    private lateinit var deviceId: String
     private lateinit var connectivityManager: ConnectivityManager
-    private var isNetworkCurrentlyConnected = false
-    private val gson = Gson()
 
-    // Schedule and playlist management (enhanced from both files)
-    private val handler = Handler(Looper.getMainLooper())
+    // Device and utils
+    private lateinit var deviceId: String
+    private val gson: Gson = Gson()
+    private val handler: Handler = Handler(Looper.getMainLooper())
+
+    // Network state
+    private var isNetworkCurrentlyConnected: Boolean = false
     private var heartbeatJob: Job? = null
     private var flickerJob: Job? = null
+
+    // Seamless video queue mapping: player media index -> playlist index
+    private val mediaIndexToPlaylistIndex = mutableListOf<Int>()
 
     // Current playlist state
     private var currentPlaylistItems: List<PlaylistItem> = emptyList()
     private var currentItemIndex = 0
     private var contentRotation = 0
     private var displayMode: String? = "contain"
+    // NEW: playlist-level transition type (Cut | Fade | Slide)
+    private var currentTransitionType: String = "Cut"
 
     // Last remote playlist for tracking changes
     private var lastRemotePlaylist: Playlist? = null
@@ -186,10 +201,19 @@ class MainActivity : AppCompatActivity() {
     // Prevent starting a new update while a previous update is in progress
     private var playlistUpdateInProgress = false
 
+    // NEW: orientation fallback state
+    private var orientationCanvasOffset: Int = 0
+    private var lastPlaylistOrientationNormalized: String? = null
+    private var backendRotationDeg: Int = 0
+
+    // NEW: preloading of the next video during image display
+    private var preloadedVideoUrl: String? = null
+
     companion object {
         private const val TAG = "MainActivity"
         private const val KEY_PENDING_PAIRING_CODE = "pendingPairingCode"
-        const val BASE_URL = "http://192.168.1.151:3000"
+        // Use 10.0.2.2 for emulator (host machine), or 192.168.1.104 for physical device
+        const val BASE_URL = "http://10.0.2.2:3000"
     }
 
     // Track once-only skip notifications per filename
@@ -261,7 +285,7 @@ class MainActivity : AppCompatActivity() {
             // NEW: force early content refresh shortly after (avoid waiting full heartbeat)
             Handler(Looper.getMainLooper()).postDelayed({
                 try { fetchAndApplyLatestPlaylist(null) } catch (_: Exception) {}
-            }, 1500)
+            }, 1500L)
         } catch (_: Exception) {}
 
         // Initialize views (restored from old file)
@@ -291,6 +315,14 @@ class MainActivity : AppCompatActivity() {
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         Log.d(TAG, "Configuration changed, forcing a re-layout and re-render.")
+        // NEW: Recompute orientation fallback offset when OS orientation changes
+        try {
+            val osPortrait = resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
+            orientationCanvasOffset = if (lastPlaylistOrientationNormalized == "portrait" && !osPortrait) 90 else 0
+            Log.d(TAG, "Recomputed orientation canvas offset on config change: ${orientationCanvasOffset}° (osPortrait=${osPortrait})")
+            // Re-apply rotation using latest backend rotation as base
+            applyContentRotation(backendRotationDeg)
+        } catch (_: Exception) {}
         // Post to handler to ensure it runs after the configuration change is fully processed
         handler.post {
             playerContainer.requestLayout() // Explicitly request a re-measure and re-layout
@@ -310,6 +342,24 @@ class MainActivity : AppCompatActivity() {
         exitButton = findViewById(R.id.exit_button)
         playerContainer = findViewById(R.id.player_container)
         offlineIndicator = findViewById(R.id.offline_indicator)
+
+        // NEW: Snapshot view for transitions
+        val existingSnapshot: ImageView? = try { findViewById(R.id.transition_snapshot_view) } catch (_: Exception) { null }
+        if (existingSnapshot != null) {
+            transitionSnapshotView = existingSnapshot
+        } else {
+            // Fallback: create programmatically to avoid NPE if layout variant missing the view
+            transitionSnapshotView = ImageView(this).apply {
+                visibility = View.GONE
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                layoutParams = FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT
+                )
+                setBackgroundColor(android.graphics.Color.BLACK)
+            }
+            playerContainer.addView(transitionSnapshotView)
+        }
 
         // PlayerManager views
         playerView = findViewById(R.id.video_player_view)
@@ -549,12 +599,10 @@ class MainActivity : AppCompatActivity() {
 
                                 // Ensure the paired screen is hidden as soon as content is assigned
                                 withContext(Dispatchers.Main) {
-                                    // Always force player visible on PLAYING
+                                    // Do NOT force player visible yet. Keep it hidden until downloads are done or playback starts.
                                     pairingView.visibility = View.GONE
-                                    isBlockingOnDownload = false
-                                    hideDownloadOverlay()
-                                    playerContainer.visibility = View.VISIBLE
-                                    playerContainer.bringToFront()
+                                    // Leave download overlay state as-is; downloadAndPlayPlaylist will decide to show it
+                                    playerContainer.visibility = View.GONE
                                 }
 
                                 if (newPlaylistFromServer != null) {
@@ -977,9 +1025,12 @@ class MainActivity : AppCompatActivity() {
             pairingView.visibility = View.GONE
             isBlockingOnDownload = false
             hideDownloadOverlay()
+            loadingBar.visibility = View.GONE
             playerContainer.visibility = View.VISIBLE
             playerContainer.bringToFront()
             applyPlaylistOrientation(playlist.orientation)
+            // NEW: store transition type from playlist
+            currentTransitionType = playlist.transitionType.ifBlank { "Cut" }
             if (playerContainer.visibility != View.VISIBLE) showPlayerScreen()
 
             currentPlaylistItems = playlist.items
@@ -1179,14 +1230,6 @@ class MainActivity : AppCompatActivity() {
 
         if (!isActivityAlive()) return
 
-        // Ensure UI state
-        handler.removeCallbacksAndMessages(null)
-        loadingBar.visibility = View.GONE
-        if (!isBlockingOnDownload) hideDownloadOverlay()
-        pairingView.visibility = View.GONE
-        playerContainer.visibility = View.VISIBLE
-        playerContainer.bringToFront()
-
         val item = currentPlaylistItems[currentItemIndex]
         Log.d(TAG, "🎬 Playing item ${currentPlaylistItems.size.takeIf { it>0 }?.let { currentItemIndex + 1 } ?: 0}/${currentPlaylistItems.size}: ${item.url}")
 
@@ -1197,7 +1240,7 @@ class MainActivity : AppCompatActivity() {
                 val f = File(path)
                 if (!f.exists() || f.length() == 0L) {
                     Log.w(TAG, "Cached file missing/empty, skipping: $path")
-                    // Silent skip: do NOT show a toast
+                    // Silent skip
                     handler.post { advanceToNextItem() }
                     return
                 }
@@ -1206,7 +1249,7 @@ class MainActivity : AppCompatActivity() {
 
         if (!isActivityAlive()) return
 
-        // Emit now_playing
+        // Emit now_playing for the new item
         try {
             val key = "${currentItemIndex}-${item.url}"
             if (lastNowPlayingKey != key) {
@@ -1275,19 +1318,66 @@ class MainActivity : AppCompatActivity() {
         nowPlayingUpdateRunnable = null
         currentItemStartedAtMs = SystemClock.uptimeMillis()
 
+        // --- Universal Transition Logic --- //
+        val currentlyPlayingView = when {
+            playerView.isVisible -> playerView
+            imagePlayerView.isVisible -> imagePlayerView
+            else -> null
+        }
+
+        var snapshot: Bitmap? = null
+        if (currentlyPlayingView != null) {
+            snapshot = captureViewToBitmap(currentlyPlayingView)
+        }
+
+        if (snapshot != null) {
+            transitionSnapshotView.setImageBitmap(snapshot)
+            transitionSnapshotView.visibility = View.VISIBLE
+            transitionSnapshotView.bringToFront()
+        } else {
+            transitionSnapshotView.visibility = View.GONE
+            transitionSnapshotView.setImageDrawable(null)
+        }
+
+        // Ensure the actual player views are initially hidden or transparent
+        playerView.visibility = View.GONE
+        imagePlayerView.visibility = View.GONE
+        playerView.alpha = 0f
+        imagePlayerView.alpha = 0f
+
         if (item.type.equals("video", ignoreCase = true)) {
-            // Video via ExoPlayer
-            imagePlayerView.visibility = View.GONE
-            playerView.visibility = View.VISIBLE
-            // NEW: apply media fit for videos
+            // Video via ExoPlayer (seamless to next video)
             applyVideoDisplayMode(item.displayMode)
             try {
-                exoPlayer?.stop()
-                exoPlayer?.clearMediaItems()
-                val mediaItem = MediaItem.fromUri(item.url)
-                exoPlayer?.setMediaItem(mediaItem)
-                exoPlayer?.prepare()
-                exoPlayer?.playWhenReady = true
+                if (preloadedVideoUrl != null && preloadedVideoUrl == item.url) {
+                    // Already prepared while previous image was showing
+                    preloadedVideoUrl = null
+                    exoPlayer?.playWhenReady = true
+                } else {
+                    val items = mutableListOf<MediaItem>()
+                    mediaIndexToPlaylistIndex.clear()
+                    items.add(MediaItem.fromUri(item.url))
+                    mediaIndexToPlaylistIndex.add(currentItemIndex)
+                    val nextIdx = (currentItemIndex + 1) % currentPlaylistItems.size
+                    val next = currentPlaylistItems.getOrNull(nextIdx)
+                    if (next != null && next.type.equals("video", true)) {
+                        items.add(MediaItem.fromUri(next.url))
+                        mediaIndexToPlaylistIndex.add(nextIdx)
+                    }
+                    exoPlayer?.setMediaItems(items, /*resetPosition*/ true)
+                    exoPlayer?.prepare()
+                    exoPlayer?.playWhenReady = true
+                }
+
+                // If player is already READY (preloaded), reveal it now
+                if (exoPlayer?.playbackState == Player.STATE_READY) {
+                    imagePlayerView.visibility = View.GONE
+                    playerContainer.visibility = View.VISIBLE
+                    playerContainer.bringToFront()
+                    playerView.visibility = View.VISIBLE
+                    playerView.alpha = 1f
+                    startContentTransition(playerView)
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start video playback", e)
                 handler.post { advanceToNextItem() }
@@ -1314,36 +1404,57 @@ class MainActivity : AppCompatActivity() {
             }
             handler.postDelayed(nowPlayingUpdateRunnable!!, 1500)
         } else {
-            // Image via Glide
+            // Image item: decode and show immediately
+            loadingBar.visibility = View.GONE
+            playerContainer.visibility = View.VISIBLE
+            playerContainer.bringToFront()
             playerView.visibility = View.GONE
             imagePlayerView.visibility = View.VISIBLE
+            imagePlayerView.alpha = 1f
+            // Don't hide snapshot here - let startContentTransition handle it
             applyImageDisplayMode(item.displayMode)
             try {
-                if (!isActivityAlive()) return
-                // Bind to the ImageView lifecycle to avoid using a destroyed Activity
-                Glide.with(imagePlayerView).load(item.url).into(imagePlayerView)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to load image", e)
-                handler.post { advanceToNextItem() }
-                return
+                val path = item.url.removePrefix("file://")
+                val bmp = android.graphics.BitmapFactory.decodeFile(path)
+                if (bmp != null) {
+                    imagePlayerView.setImageBitmap(bmp)
+                } else {
+                    Glide.with(imagePlayerView).load(item.url).into(imagePlayerView)
+                }
+            } catch (_: Exception) {
+                try { Glide.with(imagePlayerView).load(item.url).into(imagePlayerView) } catch (_: Exception) {}
             }
+            // Animate according to CMS transition (this will hide the snapshot)
+            startContentTransition(imagePlayerView)
+
+            // Preload next video in background to eliminate gap
+            try {
+                val next = currentPlaylistItems.getOrNull((currentItemIndex + 1) % currentPlaylistItems.size)
+                if (next != null && next.type.equals("video", true)) {
+                    exoPlayer?.setMediaItems(listOf(MediaItem.fromUri(next.url)), /*resetPosition*/ true)
+                    exoPlayer?.prepare()
+                    exoPlayer?.playWhenReady = false
+                    preloadedVideoUrl = next.url
+                } else {
+                    preloadedVideoUrl = null
+                }
+            } catch (_: Exception) { preloadedVideoUrl = null }
+
+            Log.d(TAG, "ImageView drawable set? ${imagePlayerView.drawable != null}")
             val seconds = if (item.duration > 0) item.duration else 8
             imageAdvanceRunnable = Runnable { advanceToNextItem() }
             handler.postDelayed(imageAdvanceRunnable!!, seconds * 1000L)
-            // Schedule periodic updates for image using elapsed time
             nowPlayingUpdateRunnable = object : Runnable {
                 override fun run() {
                     try {
-                        val elapsed = (SystemClock.uptimeMillis() - currentItemStartedAtMs).coerceAtLeast(0)
-                        val durMs = seconds * 1000L
                         wsManager?.sendJson("now_playing_update", mapOf(
                             "index" to currentItemIndex,
                             "mediaType" to item.type,
                             "url" to item.url,
                             "displayMode" to (item.displayMode ?: "contain"),
                             "rotation" to contentRotation,
-                            "positionMs" to elapsed,
-                            "durationMs" to durMs,
+                            "positionMs" to (SystemClock.uptimeMillis() - currentItemStartedAtMs),
+                            "durationMs" to (seconds * 1000L),
                             "sentAt" to System.currentTimeMillis()
                         ))
                     } catch (_: Exception) {}
@@ -1351,6 +1462,81 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             handler.postDelayed(nowPlayingUpdateRunnable!!, 1500)
+        }
+
+        // NEW: Preload next image to reduce gaps
+        try {
+            val next = currentPlaylistItems.getOrNull((currentItemIndex + 1) % currentPlaylistItems.size)
+            if (next != null && !next.url.isBlank() && next.type.equals("image", ignoreCase = true)) {
+                Glide.with(imagePlayerView).load(next.url).preload()
+            }
+        } catch (_: Exception) {}
+    }
+
+    // Helper: capture a view's content to a Bitmap
+    private fun captureViewToBitmap(view: View): Bitmap? {
+        if (view.width == 0 || view.height == 0) return null
+
+        // Special handling for PlayerView to get video frame
+        if (view is PlayerView) {
+            val videoSurfaceView = view.videoSurfaceView
+            if (videoSurfaceView is TextureView) {
+                return videoSurfaceView.bitmap
+            } else {
+                // Fallback for SurfaceView or other cases: draw the PlayerView
+                val bitmap = Bitmap.createBitmap(view.width.coerceAtLeast(1), view.height.coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+                val canvas = Canvas(bitmap)
+                view.draw(canvas)
+                return bitmap
+            }
+        }
+        // General view snapshot
+        val bitmap = Bitmap.createBitmap(view.width.coerceAtLeast(1), view.height.coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        view.draw(canvas)
+        return bitmap
+    }
+
+    // Helper: orchestrate the actual transition
+    private fun startContentTransition(newContentView: View) {
+        val t = (currentTransitionType.ifBlank { "Cut" }).lowercase()
+        val duration = when (t) { "fade" -> 250L; "slide" -> 280L; else -> 0L }
+
+        // Show the new content view immediately (it might be transparent or off-screen initially)
+        newContentView.visibility = View.VISIBLE
+
+        if (transitionSnapshotView.isVisible && transitionSnapshotView.drawable != null) {
+            when (t) {
+                "fade" -> {
+                    newContentView.alpha = 0f
+                    newContentView.animate().alpha(1f).setDuration(duration).start()
+                    transitionSnapshotView.animate().alpha(0f).setDuration(duration).withEndAction {
+                        transitionSnapshotView.visibility = View.GONE
+                        transitionSnapshotView.setImageDrawable(null)
+                        transitionSnapshotView.alpha = 1f // Reset for next use
+                    }.start()
+                }
+                "slide" -> {
+                    val w = if (rootLayout.width > 0) rootLayout.width.toFloat() else newContentView.resources.displayMetrics.widthPixels.toFloat()
+                    newContentView.translationX = w
+                    newContentView.animate().translationX(0f).setDuration(duration).start()
+                    transitionSnapshotView.animate().translationX(-w).alpha(0f).setDuration(duration).withEndAction {
+                        transitionSnapshotView.visibility = View.GONE
+                        transitionSnapshotView.setImageDrawable(null)
+                        transitionSnapshotView.alpha = 1f // Reset for next use
+                        transitionSnapshotView.translationX = 0f
+                    }.start()
+                }
+                else -> { // Cut
+                    transitionSnapshotView.visibility = View.GONE
+                    transitionSnapshotView.setImageDrawable(null)
+                }
+            }
+        } else { // No snapshot to transition out, just make new content visible
+            newContentView.alpha = 1f
+            newContentView.translationX = 0f
+            transitionSnapshotView.visibility = View.GONE
+            transitionSnapshotView.setImageDrawable(null)
         }
     }
 
@@ -1372,14 +1558,20 @@ class MainActivity : AppCompatActivity() {
     private fun initializePlayer() {
         exoPlayer = ExoPlayer.Builder(this).build()
         playerView.player = exoPlayer
+        try { playerView.setKeepContentOnPlayerReset(true) } catch (_: Exception) {}
+        try { playerView.setShutterBackgroundColor(android.graphics.Color.TRANSPARENT) } catch (_: Exception) {}
         exoPlayer?.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_READY) {
-                    // Ensure the player surface is visible when frames are ready
+                    // Ensure the player surface is visible when frames are ready; hide image only now via transition
                     hideDownloadOverlay()
                     pairingView.visibility = View.GONE
                     playerContainer.visibility = View.VISIBLE
                     playerContainer.bringToFront()
+                    playerView.visibility = View.VISIBLE
+                    playerView.alpha = 1f
+                    imagePlayerView.visibility = View.GONE
+                    startContentTransition(playerView)
 
                     // NEW: when a video is ready, send one-time metadata update (duration) without duplicating now_playing
                     try {
@@ -1406,16 +1598,48 @@ class MainActivity : AppCompatActivity() {
                     } catch (_: Exception) {}
                 }
                 if (playbackState == Player.STATE_ENDED) {
+                    // No more queued video -> advance to next (likely image or end)
                     advanceToNextItem()
                 }
             }
-            override fun onIsPlayingChanged(isPlaying: Boolean) {
-                if (isPlaying) {
-                    hideDownloadOverlay()
-                    pairingView.visibility = View.GONE
-                    playerContainer.visibility = View.VISIBLE
-                    playerContainer.bringToFront()
-                }
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                // Exo auto-advanced to the next queued video
+                val mediaIdx = exoPlayer?.currentMediaItemIndex ?: 0
+                val newIdx = mediaIndexToPlaylistIndex.getOrNull(mediaIdx) ?: return
+                currentItemIndex = newIdx
+                currentItemStartedAtMs = SystemClock.uptimeMillis()
+                // Send now_playing for the new video item
+                try {
+                    val item = currentPlaylistItems.getOrNull(currentItemIndex)
+                    if (item != null) {
+                        val key = "${currentItemIndex}-${item.url}"
+                        if (lastNowPlayingKey != key) {
+                            wsManager?.sendJson("now_playing", mapOf(
+                                "index" to currentItemIndex,
+                                "mediaType" to item.type,
+                                "url" to item.url,
+                                "displayMode" to (item.displayMode ?: "contain"),
+                                "rotation" to contentRotation,
+                                "positionMs" to 0,
+                                "durationMs" to (exoPlayer?.duration ?: (item.duration * 1000)),
+                                "sentAt" to System.currentTimeMillis()
+                            ))
+                            lastNowPlayingKey = key
+                            sentReadyUpdateForKey = false
+                        }
+                    }
+                } catch (_: Exception) {}
+                // Ensure next video is pre-queued (keep a buffer of 1 ahead)
+                try {
+                    val nextPlIdx = (currentItemIndex + 1) % currentPlaylistItems.size
+                    if (mediaIndexToPlaylistIndex.size <= mediaIdx + 1) {
+                        val next = currentPlaylistItems.getOrNull(nextPlIdx)
+                        if (next != null && next.type.equals("video", true)) {
+                            exoPlayer?.addMediaItem(MediaItem.fromUri(next.url))
+                            mediaIndexToPlaylistIndex.add(nextPlIdx)
+                        }
+                    }
+                } catch (_: Exception) {}
             }
             // NEW: handle playback errors by deleting bad cache, re-queuing download, and skipping forward
             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
@@ -1445,6 +1669,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyPlaylistOrientation(orientation: String?) {
         val normalized = orientation?.trim()?.lowercase()
+        lastPlaylistOrientationNormalized = normalized
         val newOrientation = when (normalized) {
             "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
             "landscape" -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
@@ -1454,17 +1679,31 @@ class MainActivity : AppCompatActivity() {
             Log.d(TAG, "Requesting orientation change to: ${normalized ?: "unspecified"}")
             requestedOrientation = newOrientation
         }
+        // NEW: Fallback – if device refuses to switch to portrait (common on TV boxes),)
+        // rotate the canvas by 90° so portrait content renders correctly.
+        val osPortrait = resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
+        orientationCanvasOffset = if (normalized == "portrait" && !osPortrait) 90 else 0
+        Log.d(TAG, "Orientation canvas offset: ${orientationCanvasOffset}° (osPortrait=${osPortrait})")
+        // Re-apply rotation with the new offset combined with backend rotation
+        applyContentRotation(backendRotationDeg)
     }
 
-    // NEW: apply content rotation coming from backend (0/90/180/270)
+    // NEW: apply content rotation from backend (0/90/180/270) + orientation fallback offset
     private fun applyContentRotation(rotationDegrees: Int) {
         val rot = ((rotationDegrees % 360) + 360) % 360 // normalize
-        Log.d(TAG, "Applying content rotation: $rot°")
-        // Remember the screen rotation coming from CMS so we can report it in now_playing
-        contentRotation = rot
+        backendRotationDeg = rot
+        val effective = ((rot + orientationCanvasOffset) % 360 + 360) % 360
+        Log.d(TAG, "Applying content rotation: ${rot}° + offset ${orientationCanvasOffset}° = ${effective}°")
+        // Remember the effective rotation so we can report it in now_playing
+        contentRotation = effective
         // Rotate both the image and video containers
-        imagePlayerView.rotation = rot.toFloat()
-        playerView.rotation = rot.toFloat()
+        imagePlayerView.rotation = effective.toFloat()
+        playerView.rotation = effective.toFloat()
+    }
+
+    // NEW: orientationCanvasOffset getter for testing
+    fun getOrientationCanvasOffset(): Int {
+        return orientationCanvasOffset
     }
 
     private fun showPlayerScreen() {
@@ -1563,6 +1802,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun md5(input: String): String {
         return try {
+
+
+
+
             val md = MessageDigest.getInstance("MD5")
             val bytes = md.digest(input.toByteArray())
             bytes.joinToString("") { "%02x".format(it) }
@@ -1582,7 +1825,7 @@ class MainActivity : AppCompatActivity() {
                 itemCount = currentPlaylistItems.size,
                 currentIndex = if (idx >= 0) idx else 0,
                 currentUrl = current?.url,
-                currentType = current?.type,
+                               currentType = current?.type,
                 decoderName = decoder,
                 droppedFrames = null, // optional, can be wired with analytics later
                 lastDownloadErrors = null
@@ -1720,6 +1963,7 @@ class MainActivity : AppCompatActivity() {
                     try {
                         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
                         val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                       
                         val target = (perc.coerceIn(0f, 100f) / 100f * max).toInt().coerceIn(0, max)
                         am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
                         // Also set ExoPlayer volume immediately (0..1)
@@ -1989,28 +2233,37 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun scheduleAppRestart(delayMs: Long = 500) {
-        // Always schedule a reliable restart via AlarmManager to avoid losing the restart when handlers are cleared
+        // Production-grade restart: AlarmManager bypasses Doze mode and battery optimization
         try {
             val ctx = applicationContext
             val launch = packageManager?.getLaunchIntentForPackage(packageName)
             if (launch != null) {
+                // Use CLEAR_TOP for better compatibility across Android versions
                 launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                
                 val pi = PendingIntent.getActivity(
                     ctx,
-                    0,
+                    123, // Unique request code for restart operations
                     launch,
                     PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE
                 )
                 val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
                 val triggerAt = System.currentTimeMillis() + delayMs
-                // Use setAlarmClock for user-visible restart, most reliable across vendors
-                val info = AlarmManager.AlarmClockInfo(triggerAt, pi)
-                am.setAlarmClock(info, pi)
+                
+                // setExactAndAllowWhileIdle: Most reliable for physical devices
+                // Works even in Doze mode and with aggressive battery optimization
+                am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pi)
+                
+                Log.i(TAG, "⏰ Restart scheduled in ${delayMs}ms via AlarmManager")
             }
-        } catch (_: Exception) { }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to schedule restart: ${e.message}")
+        }
 
-        // Finish current task/process so launcher intent restarts from a clean state
+        // Clean up resources and finish activity
         try { exoPlayer?.release() } catch (_: Exception) {}
-        try { finishAndRemoveTask() } catch (_: Exception) { finishAffinity() }
+        try { 
+            finishAffinity()
+        } catch (_: Exception) {}
     }
 }

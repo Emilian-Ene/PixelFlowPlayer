@@ -6,17 +6,18 @@ data class Playlist(
     val transitionType: String = "Cut"      // Cut | Fade | Slide (future-proof)
 ) {
     /**
-     * Compares this playlist to another, checking essential content and presentation properties.
+     * Compares this playlist to another, focusing on the set/order of media items only.
+     * - Ignores playlist-level presentation (orientation, transitionType) so UI changes
+     *   won’t trigger cache purge or re-downloads.
      * - Ignores local vs remote URL prefixes by comparing only the filename.
      * - Strips optional cache hash prefixes like "<md5>_" from local file names before compare.
-     * - Compares orientation and transitionType.
      * - Compares each item's type, url filename, duration, displayMode, and optional dimensions.
      */
     fun isContentEqualTo(other: Playlist?): Boolean {
         if (other == null) return false
 
-        if (this.orientation != other.orientation) return false
-        if (this.transitionType != other.transitionType) return false
+        // NOTE: Do NOT compare orientation or transitionType here. Those are presentation-only
+        // and should not force re-downloads.
         if (this.items.size != other.items.size) return false
 
         fun normalize(name: String): String {

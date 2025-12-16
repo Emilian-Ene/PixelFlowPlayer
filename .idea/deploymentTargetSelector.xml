@@ -4,10 +4,10 @@
     <selectionStates>
       <SelectionState runConfigName="app">
         <option name="selectionMode" value="DROPDOWN" />
-        <DropdownSelection timestamp="2025-10-01T01:28:16.753020600Z">
+        <DropdownSelection timestamp="2025-12-16T00:53:12.743528600Z">
           <Target type="DEFAULT_BOOT">
             <handle>
-              <DeviceId pluginId="LocalEmulator" identifier="path=C:\Users\ionut\.android\avd\Television_1080p.avd" />
+              <DeviceId pluginId="LocalEmulator" identifier="path=C:\Users\ionut\.android\avd\Medium_Tablet.avd" />
             </handle>
           </Target>
         </DropdownSelection>
