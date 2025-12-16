@@ -11,8 +11,9 @@ PixelFlow Player is an offline‑first Android digital signage app:
 1) Prerequisites
    - Android 8.0+ device or emulator with internet access.
    - Backend reachable from the device.
-     - Emulator: backend host should be `10.0.2.2` (already set in `player/ApiService.kt`).
-     - Physical device: set HOST_IP in `player/ApiService.kt` to your computer’s LAN IP (e.g., `192.168.x.x`). Rebuild the APK.
+     - **Emulator**: Set `BASE_URL = "http://10.0.2.2:3000"` in `MainActivity.kt` (line ~216) and `HOST_IP = "10.0.2.2"` in `ApiService.kt` (line ~126).
+     - **Physical device**: Set `BASE_URL = "http://192.168.1.104:3000"` in `MainActivity.kt` and `HOST_IP = "192.168.1.104"` in `ApiService.kt` to your backend's LAN IP.
+     - **IMPORTANT**: Must rebuild APK (`./gradlew clean assembleDebug`) and reinstall after changing IPs.
 2) Install
    - Build from Android Studio (Run) or generate APK: Gradle task `assembleDebug`/`assembleRelease` and sideload.
 3) First launch sequence (logic)
